@@ -1,0 +1,18 @@
+[package]
+name = "kaniko-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kaniko-core = { workspace = true }
+kaniko-creds = { workspace = true }
+oci-image = { workspace = true }
+oci-registry = { workspace = true }
+dockerfile-parser = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tar = { workspace = true }

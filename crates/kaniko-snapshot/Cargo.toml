@@ -1,0 +1,19 @@
+[package]
+name = "kaniko-snapshot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+oci-image = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+walkdir = { workspace = true }
+tar = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+nix = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

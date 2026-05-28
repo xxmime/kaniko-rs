@@ -1,0 +1,75 @@
+[workspace]
+members = [
+    "crates/oci-image",
+    "crates/oci-registry",
+    "crates/dockerfile-parser",
+    "crates/kaniko-snapshot",
+    "crates/kaniko-cache",
+    "crates/kaniko-creds",
+    "crates/kaniko-core",
+    "crates/kaniko-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/xxmime/kaniko"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Crypto / Digest
+sha2 = "0.10"
+digest = "0.10"
+hex = "0.4"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# HTTP
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Tar / Compression
+tar = "0.4"
+flate2 = "1"
+
+# Filesystem
+walkdir = "2"
+
+# System calls (Linux)
+nix = { version = "0.30", features = ["fs"] }
+
+# Internal crates
+oci-image = { path = "crates/oci-image" }
+oci-registry = { path = "crates/oci-registry" }
+dockerfile-parser = { path = "crates/dockerfile-parser" }
+kaniko-snapshot = { path = "crates/kaniko-snapshot" }
+kaniko-cache = { path = "crates/kaniko-cache" }
+kaniko-creds = { path = "crates/kaniko-creds" }
+kaniko-core = { path = "crates/kaniko-core" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
