@@ -8,4 +8,4 @@ pub mod parse;
 pub mod heredoc;
 
 pub use instruction::Instruction;
-pub use parse::{parse_dockerfile, parse_dockerfile_with_build_args, VarContext, substitute_vars, Stage};
+pub use parse::{parse_dockerfile, parse_dockerfile_with_build_args, VarContext, substitute_vars, Stage, ParseError};

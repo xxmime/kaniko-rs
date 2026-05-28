@@ -8,6 +8,7 @@ members = [
     "crates/kaniko-creds",
     "crates/kaniko-core",
     "crates/kaniko-cli",
+    "crates/kaniko-util",
 ]
 resolver = "2"
 
@@ -36,7 +37,7 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Error handling
 thiserror = "2"

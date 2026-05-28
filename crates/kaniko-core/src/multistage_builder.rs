@@ -95,7 +95,7 @@ impl MultiStageBuilder {
     ///
     /// Uses topological sorting to ensure stages are built in the correct order
     /// when they have cross-stage dependencies.
-    fn determine_build_order(&self) -> Result<Vec<usize>> {
+    pub fn determine_build_order(&self) -> Result<Vec<usize>> {
         // Build dependency graph
         let mut dependencies: HashMap<usize, HashSet<usize>> = HashMap::new();
         let mut dependents: HashMap<usize, HashSet<usize>> = HashMap::new();

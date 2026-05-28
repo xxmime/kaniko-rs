@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 kaniko-core = { workspace = true }
 kaniko-creds = { workspace = true }
+kaniko-snapshot = { workspace = true }
 oci-image = { workspace = true }
 oci-registry = { workspace = true }
 dockerfile-parser = { workspace = true }
