@@ -137,19 +137,25 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     c.execute(&mut container_config, &build_args).await
                 }
                 dockerfile_parser::Instruction::Copy(copy) => {
-                    let c = CopyCommand::new(
+                    let c = CopyCommand::with_flags(
                         copy.sources.clone(),
                         copy.destination.clone(),
                         copy.from.clone(),
+                        copy.chown.clone(),
+                        copy.chmod.clone(),
+                        copy.link,
                         context_path.clone(),
                         cli.cache,
                     );
                     c.execute(&mut container_config, &build_args).await
                 }
                 dockerfile_parser::Instruction::Add(add) => {
-                    let c = AddCommand::new(
+                    let c = AddCommand::with_flags(
                         add.sources.clone(),
                         add.destination.clone(),
+                        add.chown.clone(),
+                        add.chmod.clone(),
+                        add.link,
                         context_path.clone(),
                         cli.cache,
                     );
@@ -269,7 +275,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // Write to OCI layout if requested
             if let Some(ref layout_path) = cli.oci_layout_path {
                 tracing::info!("Writing OCI layout to {}", layout_path);
-                write_oci_layout(&image, layout_path)?;
+                oci_image::layout::write_layout(&image, std::path::Path::new(layout_path))?;
             }
 
             break; // Only build one target
@@ -325,36 +331,5 @@ fn write_image_tar(image: &MutableImage, path: &str) -> Result<(), Box<dyn std::
     }
 
     tar_builder.finish()?;
-    Ok(())
-}
-
-/// Write image as OCI layout directory.
-fn write_oci_layout(image: &MutableImage, path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let root = std::path::Path::new(path);
-
-    std::fs::create_dir_all(root)?;
-    std::fs::write(root.join("oci-layout"), r#"{"imageLayoutVersion":"1.0.0"}"#)?;
-
-    let blob_dir = root.join("blobs/sha256");
-    std::fs::create_dir_all(&blob_dir)?;
-
-    std::fs::write(blob_dir.join(image.config_digest().to_string()), &image.config_bytes)?;
-
-    for layer in &image.layers {
-        std::fs::write(blob_dir.join(layer.digest().to_string()), layer.data())?;
-    }
-
-    let manifest_bytes = serde_json::to_vec(&image.manifest)?;
-    let index_json = serde_json::json!({
-        "schemaVersion": 2,
-        "manifests": [{
-            "mediaType": image.manifest.media_type.as_deref().unwrap_or("application/vnd.oci.image.manifest.v1+json"),
-            "digest": image.digest().to_string(),
-            "size": manifest_bytes.len(),
-        }]
-    });
-    std::fs::write(root.join("index.json"), serde_json::to_string_pretty(&index_json)?)?;
-    std::fs::write(blob_dir.join(image.digest().to_string()), &manifest_bytes)?;
-
     Ok(())
 }

@@ -87,13 +87,46 @@ impl CopyCommand {
                 )));
             }
 
-            if src_path.is_dir() {
-                copy_dir_recursive(&src_path, Path::new(dest), &self.chown, &self.chmod)?;
-            } else {
-                let dest_path = if dest.ends_with('/') || Path::new(dest).is_dir() {
-                    PathBuf::from(dest).join(src_path.file_name().unwrap_or_default())
+            // Resolve destination if it's a symlink
+            let resolved_dest = resolve_if_symlink(dest)?;
+
+            let metadata = std::fs::symlink_metadata(&src_path)?;
+            if metadata.is_dir() {
+                copy_dir_recursive(&src_path, Path::new(&resolved_dest), &self.chown, &self.chmod)?;
+            } else if metadata.file_type().is_symlink() {
+                // Copy symlink target
+                let link_target = std::fs::read_link(&src_path)?;
+                let dest_path = if resolved_dest.ends_with('/') || Path::new(&resolved_dest).is_dir() {
+                    PathBuf::from(&resolved_dest).join(src_path.file_name().unwrap_or_default())
                 } else {
-                    PathBuf::from(dest)
+                    PathBuf::from(&resolved_dest)
+                };
+                if let Some(parent) = dest_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                // Copy the symlink itself
+                #[cfg(unix)]
+                {
+                    std::os::unix::fs::symlink(&link_target, &dest_path)?;
+                }
+                #[cfg(not(unix))]
+                {
+                    // On non-Unix, copy the target file instead
+                    let real_src = if link_target.is_absolute() {
+                        link_target
+                    } else {
+                        src_path.parent().unwrap_or(Path::new(".")).join(&link_target)
+                    };
+                    if real_src.exists() {
+                        copy_file(&real_src, &dest_path, &self.chown, &self.chmod)?;
+                    }
+                }
+                apply_permissions(&dest_path, &self.chown, &self.chmod)?;
+            } else {
+                let dest_path = if resolved_dest.ends_with('/') || Path::new(&resolved_dest).is_dir() {
+                    PathBuf::from(&resolved_dest).join(src_path.file_name().unwrap_or_default())
+                } else {
+                    PathBuf::from(&resolved_dest)
                 };
                 copy_file(&src_path, &dest_path, &self.chown, &self.chmod)?;
             }
@@ -218,7 +251,51 @@ fn resolve_destination(dest: &str, config: &ContainerConfig) -> String {
     }
 }
 
+/// Resolve destination path if it (or its parent dirs) contains symlinks.
+/// Analogous to Go: `commands.resolveIfSymlink`.
+fn resolve_if_symlink(dest: &str) -> Result<String> {
+    if !dest.starts_with('/') {
+        return Ok(dest.to_string());
+    }
+
+    let mut current = PathBuf::from("/");
+    let parts: Vec<&str> = dest.trim_start_matches('/').split('/').collect();
+
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        current = current.join(part);
+
+        if current.is_symlink() {
+            let link_target = std::fs::read_link(&current)?;
+            if link_target.is_absolute() {
+                // Replace current with the resolved target + remaining parts
+                let remaining = parts[i + 1..].join("/");
+                current = link_target;
+                if !remaining.is_empty() {
+                    current = current.join(remaining);
+                }
+                // Recurse to handle chained symlinks
+                let resolved = resolve_if_symlink(&current.to_string_lossy())?;
+                return Ok(resolved);
+            } else {
+                // Relative symlink: resolve relative to parent
+                let parent = current.parent().unwrap_or(Path::new("/"));
+                current = parent.join(&link_target);
+            }
+        }
+    }
+
+    Ok(current.to_string_lossy().to_string())
+}
+
 /// Apply --chown and --chmod permissions to a file or directory.
+/// Apply --chown and --chmod permissions to a file or directory. (Public for reuse by AddCommand)
+pub fn apply_permissions_pub(path: &Path, chown: &Option<String>, chmod: &Option<String>) -> Result<()> {
+    apply_permissions(path, chown, chmod)
+}
+
 fn apply_permissions(path: &Path, chown: &Option<String>, chmod: &Option<String>) -> Result<()> {
     if let Some(chmod_val) = chmod {
         let mode = u32::from_str_radix(chmod_val, 8).map_err(|e| {

@@ -14,6 +14,9 @@ use std::sync::Mutex;
 pub struct AddCommand {
     sources: Vec<String>,
     destination: String,
+    chown: Option<String>,
+    chmod: Option<String>,
+    link: bool,
     should_cache: bool,
     snapshot_files: Mutex<Vec<PathBuf>>,
     context_dir: PathBuf,
@@ -29,6 +32,31 @@ impl AddCommand {
         Self {
             sources,
             destination,
+            chown: None,
+            chmod: None,
+            link: false,
+            should_cache,
+            snapshot_files: Mutex::new(vec![]),
+            context_dir,
+        }
+    }
+
+    /// Create an AddCommand with all flags from the parsed instruction.
+    pub fn with_flags(
+        sources: Vec<String>,
+        destination: String,
+        chown: Option<String>,
+        chmod: Option<String>,
+        link: bool,
+        context_dir: PathBuf,
+        should_cache: bool,
+    ) -> Self {
+        Self {
+            sources,
+            destination,
+            chown,
+            chmod,
+            link,
             should_cache,
             snapshot_files: Mutex::new(vec![]),
             context_dir,
@@ -40,12 +68,18 @@ impl AddCommand {
 impl BaseCommand for AddCommand {
     async fn execute_impl(&self, config: &mut ContainerConfig, _args: &BuildArgs) -> Result<()> {
         let dest = resolve_add_destination(&self.destination, config);
-        tracing::info!("ADD {:?} {}", self.sources, dest);
+        tracing::info!(
+            "ADD {:?} {} (chown={:?}, chmod={:?}, link={})",
+            self.sources, dest, self.chown, self.chmod, self.link
+        );
 
         for src in &self.sources {
             if src.starts_with("http://") || src.starts_with("https://") {
-                // Download from URL
+                // Download from URL — permissions default to 0600 per Docker spec
                 let downloaded_path = download_url(src, &dest).await?;
+                // Apply chmod: URL downloads default to 0600 unless --chmod is specified
+                let effective_chmod = self.chmod.as_deref().unwrap_or("600");
+                crate::command::copy::apply_permissions_pub(&downloaded_path, &self.chown, &Some(effective_chmod.to_string()))?;
                 self.snapshot_files.lock().unwrap().push(downloaded_path);
             } else {
                 let src_path = self.context_dir.join(src);
@@ -59,16 +93,21 @@ impl BaseCommand for AddCommand {
                 // Check if source is a tar archive (auto-extract)
                 if src.ends_with(".tar") || src.ends_with(".tar.gz") || src.ends_with(".tgz") {
                     extract_tar(&src_path, &dest)?;
+                    // Apply permissions to extracted files
+                    if self.chown.is_some() || self.chmod.is_some() {
+                        apply_permissions_recursive(&dest, &self.chown, &self.chmod)?;
+                    }
                 } else if src_path.is_dir() {
-                    copy_dir_recursive(&src_path, Path::new(&dest))?;
+                    copy_dir_recursive_with_perms(&src_path, Path::new(&dest), &self.chown, &self.chmod)?;
                 } else {
                     let dest_path = if dest.ends_with('/') || Path::new(&dest).is_dir() {
                         PathBuf::from(&dest).join(src_path.file_name().unwrap_or_default())
                     } else {
                         PathBuf::from(&dest)
                     };
-                    copy_file(&src_path, &dest_path)?;
+                    copy_file_with_perms(&src_path, &dest_path, &self.chown, &self.chmod)?;
                 }
+                self.snapshot_files.lock().unwrap().push(PathBuf::from(&dest));
             }
         }
 
@@ -76,7 +115,19 @@ impl BaseCommand for AddCommand {
     }
 
     fn command_string_impl(&self) -> String {
-        format!("ADD {} {}", self.sources.join(" "), self.destination)
+        let mut parts = Vec::new();
+        if let Some(ref c) = self.chown {
+            parts.push(format!("--chown={}", c));
+        }
+        if let Some(ref c) = self.chmod {
+            parts.push(format!("--chmod={}", c));
+        }
+        if self.link {
+            parts.push("--link".to_string());
+        }
+        parts.extend(self.sources.iter().cloned());
+        parts.push(self.destination.clone());
+        format!("ADD {}", parts.join(" "))
     }
 
     fn metadata_only_impl(&self) -> bool { false }
@@ -129,23 +180,37 @@ fn resolve_add_destination(dest: &str, config: &ContainerConfig) -> String {
     }
 }
 
-fn copy_file(src: &Path, dest: &Path) -> Result<()> {
+fn copy_file_with_perms(src: &Path, dest: &Path, chown: &Option<String>, chmod: &Option<String>) -> Result<()> {
     if let Some(parent) = dest.parent() { std::fs::create_dir_all(parent)?; }
     std::fs::copy(src, dest)?;
+    crate::command::copy::apply_permissions_pub(dest, chown, chmod)?;
     Ok(())
 }
 
-fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
+fn copy_dir_recursive_with_perms(src: &Path, dest: &Path, chown: &Option<String>, chmod: &Option<String>) -> Result<()> {
     let dest = dest.join(src.file_name().unwrap_or_default());
     for entry in walkdir::WalkDir::new(src) {
         let entry = entry?;
         let rel = entry.path().strip_prefix(src).unwrap_or(entry.path());
         let target = dest.join(rel);
-        if entry.file_type().is_dir() { std::fs::create_dir_all(&target)?; }
-        else {
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&target)?;
+            crate::command::copy::apply_permissions_pub(&target, chown, chmod)?;
+        } else {
             if let Some(parent) = target.parent() { std::fs::create_dir_all(parent)?; }
             std::fs::copy(entry.path(), &target)?;
+            crate::command::copy::apply_permissions_pub(&target, chown, chmod)?;
         }
+    }
+    Ok(())
+}
+
+fn apply_permissions_recursive(dest: &str, chown: &Option<String>, chmod: &Option<String>) -> Result<()> {
+    let dest_path = Path::new(dest);
+    if !dest_path.exists() { return Ok(()); }
+    for entry in walkdir::WalkDir::new(dest_path) {
+        let entry = entry?;
+        crate::command::copy::apply_permissions_pub(entry.path(), chown, chmod)?;
     }
     Ok(())
 }

@@ -1233,6 +1233,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
