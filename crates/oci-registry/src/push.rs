@@ -9,7 +9,7 @@
 //! 6. Push manifest (PUT /v2/<name>/manifests/<reference>)
 
 use crate::auth::RegistryAuth;
-use crate::transport::{build_client, RetryConfig};
+use crate::transport::build_client;
 use oci_image::manifest::MediaType;
 use oci_image::mutate::MutableImage;
 use thiserror::Error;
@@ -33,6 +33,43 @@ pub enum PushError {
 
 /// Result type for push operations.
 pub type Result<T> = std::result::Result<T, PushError>;
+
+/// Options for controlling push behavior.
+#[derive(Debug, Clone)]
+pub struct PushOptions {
+    /// Maximum number of concurrent layer uploads.
+    /// Defaults to 4. Set to 1 for sequential uploads.
+    pub max_concurrent_uploads: usize,
+    /// Whether to skip TLS verification.
+    pub insecure: bool,
+}
+
+impl Default for PushOptions {
+    fn default() -> Self {
+        Self {
+            max_concurrent_uploads: 4,
+            insecure: false,
+        }
+    }
+}
+
+impl PushOptions {
+    /// Create options for sequential (non-parallel) uploads.
+    pub fn sequential() -> Self {
+        Self {
+            max_concurrent_uploads: 1,
+            ..Default::default()
+        }
+    }
+
+    /// Create options with a specific concurrency limit.
+    pub fn with_concurrency(max_concurrent: usize) -> Self {
+        Self {
+            max_concurrent_uploads: max_concurrent,
+            ..Default::default()
+        }
+    }
+}
 
 /// Parsed reference: registry / repository / tag.
 #[derive(Debug, Clone)]
@@ -73,45 +110,51 @@ pub async fn push_image(
     destination: &str,
     auth: &RegistryAuth,
 ) -> Result<()> {
-    let reference = Reference::parse(destination)?;
-    let base_url = reference.base_url(auth.insecure);
-    let client = build_client(auth.insecure);
-    let _retry = RetryConfig::default();
+    push_image_with_options(image, destination, auth, PushOptions::default()).await
+}
 
-    tracing::info!("Pushing image to {}", destination);
+/// Push an image to a registry with configurable options.
+///
+/// Uses `PushOptions` to control concurrency and other behavior.
+/// With `max_concurrent_uploads > 1`, layers are uploaded in parallel
+/// using tokio concurrent tasks.
+pub async fn push_image_with_options(
+    image: &MutableImage,
+    destination: &str,
+    auth: &RegistryAuth,
+    opts: PushOptions,
+) -> Result<()> {
+    let reference = Reference::parse(destination)?;
+    let base_url = reference.base_url(opts.insecure);
+    let client = build_client(opts.insecure);
+
+    tracing::info!(
+        "Pushing image to {} (concurrency: {})",
+        destination,
+        opts.max_concurrent_uploads
+    );
 
     // Step 1: Authenticate and get Bearer token
     let token = authenticate(&client, &base_url, &reference.repository, auth).await?;
     let auth_header = format_auth_header(&token);
 
-    // Step 2: Upload layer blobs
-    for (i, layer) in image.layers.iter().enumerate() {
-        let digest = layer.digest().to_string();
-        tracing::info!("Uploading layer {}/{}: {}", i + 1, image.layers.len(), digest);
-
-        // Check if blob already exists
-        if blob_exists(&client, &base_url, &reference.repository, &digest, &auth_header).await? {
-            tracing::debug!("Blob {} already exists, skipping upload", digest);
-            continue;
-        }
-
-        // Upload blob
-        upload_blob(
-            &client,
-            &base_url,
-            &reference.repository,
-            &digest,
-            layer.data(),
-            &auth_header,
-        )
-        .await?;
-    }
+    // Step 2: Upload layer blobs (parallel or sequential)
+    push_layers_concurrent(
+        &client,
+        &base_url,
+        &reference.repository,
+        &auth_header,
+        image,
+        opts.max_concurrent_uploads,
+    )
+    .await?;
 
     // Step 3: Upload config blob
     let config_digest = image.config_digest().to_string();
     tracing::info!("Uploading config: {}", config_digest);
 
-    if !blob_exists(&client, &base_url, &reference.repository, &config_digest, &auth_header).await? {
+    if !blob_exists(&client, &base_url, &reference.repository, &config_digest, &auth_header).await?
+    {
         upload_blob(
             &client,
             &base_url,
@@ -131,7 +174,11 @@ pub async fn push_image(
         base_url, reference.repository, reference.tag
     );
 
-    let content_type = image.manifest.media_type.as_deref().unwrap_or(MediaType::IMAGE_MANIFEST_V1S2);
+    let content_type = image
+        .manifest
+        .media_type
+        .as_deref()
+        .unwrap_or(MediaType::IMAGE_MANIFEST_V1S2);
     let resp = client
         .put(&manifest_url)
         .header("Authorization", &auth_header)
@@ -150,6 +197,152 @@ pub async fn push_image(
     }
 
     tracing::info!("Successfully pushed {}", destination);
+    Ok(())
+}
+
+/// Upload image layers with configurable concurrency.
+///
+/// When `max_concurrent > 1`, layers that don't already exist in the
+/// registry are uploaded in parallel using tokio::JoinSet.
+/// This significantly improves push speed for images with many layers.
+async fn push_layers_concurrent(
+    client: &reqwest::Client,
+    base_url: &str,
+    repository: &str,
+    auth_header: &str,
+    image: &MutableImage,
+    max_concurrent: usize,
+) -> Result<()> {
+    use tokio::task::JoinSet;
+    use std::sync::Arc;
+
+    let total = image.layers.len();
+    if total == 0 {
+        return Ok(());
+    }
+
+    if max_concurrent <= 1 {
+        // Sequential mode: upload one at a time
+        for (i, layer) in image.layers.iter().enumerate() {
+            let digest = layer.digest().to_string();
+            tracing::info!("Uploading layer {}/{}: {}", i + 1, total, digest);
+
+            if blob_exists(client, base_url, repository, &digest, auth_header).await? {
+                tracing::debug!("Blob {} already exists, skipping upload", digest);
+                continue;
+            }
+
+            upload_blob(
+                client,
+                base_url,
+                repository,
+                &digest,
+                layer.data(),
+                auth_header,
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+
+    // Parallel mode: check which layers need uploading, then upload concurrently
+    tracing::info!(
+        "Checking {} layers for existence (max {} concurrent uploads)",
+        total,
+        max_concurrent
+    );
+
+    // First pass: check existence (sequential, fast HEAD requests)
+    let mut layers_to_upload: Vec<(usize, String, Vec<u8>)> = Vec::new();
+    for (i, layer) in image.layers.iter().enumerate() {
+        let digest = layer.digest().to_string();
+        if blob_exists(client, base_url, repository, &digest, auth_header).await? {
+            tracing::debug!("Layer {}/{}: {} already exists", i + 1, total, digest);
+        } else {
+            layers_to_upload.push((i, digest, layer.data().to_vec()));
+        }
+    }
+
+    let to_upload_count = layers_to_upload.len();
+    if to_upload_count == 0 {
+        tracing::info!("All {} layers already exist in registry", total);
+        return Ok(());
+    }
+
+    tracing::info!(
+        "Uploading {}/{} layers in parallel (max {} concurrent)",
+        to_upload_count,
+        total,
+        max_concurrent
+    );
+
+    // Parallel upload using JoinSet with semaphore-like limiting
+    let client = Arc::new(client.clone());
+    let base_url = base_url.to_string();
+    let repository = repository.to_string();
+    let auth_header = auth_header.to_string();
+
+    let mut join_set = JoinSet::new();
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+    let mut uploaded = 0usize;
+
+    for (idx, digest, data) in layers_to_upload {
+        let client = Arc::clone(&client);
+        let base_url = base_url.clone();
+        let repository = repository.clone();
+        let auth_header = auth_header.clone();
+        let permit = semaphore.clone();
+
+        join_set.spawn(async move {
+            let _permit = permit.acquire().await.unwrap();
+            tracing::info!("Uploading layer {}/{}: {}", idx + 1, total, digest);
+            let result = upload_blob(
+                &*client,
+                &base_url,
+                &repository,
+                &digest,
+                &data,
+                &auth_header,
+            )
+            .await;
+            (idx, digest, result)
+        });
+    }
+
+    // Collect results
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok((_idx, digest, Ok(()))) => {
+                uploaded += 1;
+                tracing::info!(
+                    "Layer upload {}/{} complete: {}",
+                    uploaded,
+                    to_upload_count,
+                    digest
+                );
+            }
+            Ok((idx, digest, Err(e))) => {
+                return Err(PushError::Failed(format!(
+                    "layer {} ({}) upload failed: {}",
+                    idx + 1,
+                    digest,
+                    e
+                )));
+            }
+            Err(e) => {
+                return Err(PushError::Failed(format!(
+                    "layer upload task panicked: {}",
+                    e
+                )));
+            }
+        }
+    }
+
+    tracing::info!(
+        "All {}/{} layer uploads complete",
+        uploaded,
+        to_upload_count
+    );
     Ok(())
 }
 
@@ -351,4 +544,63 @@ fn base64_encode(s: &str) -> String {
         result.push(if chunk.len() > 2 { CHARSET[(n & 0x3F) as usize] as char } else { '=' });
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_reference_parse() {
+        let ref1 = Reference::parse("gcr.io/my-project/my-app:latest").unwrap();
+        assert_eq!(ref1.registry, "gcr.io");
+        assert_eq!(ref1.repository, "my-project/my-app");
+        assert_eq!(ref1.tag, "latest");
+
+        let ref2 = Reference::parse("localhost:5000/my-app:v1").unwrap();
+        assert_eq!(ref2.registry, "localhost:5000");
+        assert_eq!(ref2.repository, "my-app");
+        assert_eq!(ref2.tag, "v1");
+
+        let ref3 = Reference::parse("registry.example.com/app").unwrap();
+        assert_eq!(ref3.tag, "latest"); // default tag
+    }
+
+    #[test]
+    fn test_reference_base_url() {
+        let ref1 = Reference::parse("gcr.io/my-app:latest").unwrap();
+        assert_eq!(ref1.base_url(false), "https://gcr.io/v2");
+        assert_eq!(ref1.base_url(true), "http://gcr.io/v2");
+    }
+
+    #[test]
+    fn test_push_options_default() {
+        let opts = PushOptions::default();
+        assert_eq!(opts.max_concurrent_uploads, 4);
+        assert!(!opts.insecure);
+    }
+
+    #[test]
+    fn test_push_options_sequential() {
+        let opts = PushOptions::sequential();
+        assert_eq!(opts.max_concurrent_uploads, 1);
+    }
+
+    #[test]
+    fn test_push_options_with_concurrency() {
+        let opts = PushOptions::with_concurrency(8);
+        assert_eq!(opts.max_concurrent_uploads, 8);
+    }
+
+    #[test]
+    fn test_base64_encode() {
+        assert_eq!(base64_encode("user:pass"), "dXNlcjpwYXNz");
+        assert_eq!(base64_encode("hello"), "aGVsbG8=");
+    }
+
+    #[test]
+    fn test_format_auth_header() {
+        assert_eq!(format_auth_header(""), "");
+        assert_eq!(format_auth_header("Bearer abc123"), "Bearer abc123");
+    }
 }

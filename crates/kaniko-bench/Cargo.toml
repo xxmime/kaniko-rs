@@ -1,0 +1,25 @@
+[package]
+name = "kaniko-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dockerfile-parser = { workspace = true }
+oci-image = { workspace = true }
+kaniko-snapshot = { workspace = true }
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+tar = "0.4"
+
+[[bench]]
+name = "dockerfile_parse"
+harness = false
+
+[[bench]]
+name = "layer_creation"
+harness = false
+
+[[bench]]
+name = "snapshot_walk"
+harness = false

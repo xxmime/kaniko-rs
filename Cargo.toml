@@ -9,6 +9,7 @@ members = [
     "crates/kaniko-core",
     "crates/kaniko-cli",
     "crates/kaniko-util",
+    "crates/kaniko-bench",
 ]
 resolver = "2"
 

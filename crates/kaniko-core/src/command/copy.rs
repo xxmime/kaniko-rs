@@ -46,6 +46,31 @@ impl CopyCommand {
         }
     }
 
+    /// Create a CopyCommand with all flags from the parsed instruction.
+    pub fn with_flags(
+        sources: Vec<String>,
+        destination: String,
+        from: Option<String>,
+        chown: Option<String>,
+        chmod: Option<String>,
+        link: bool,
+        context_dir: PathBuf,
+        should_cache: bool,
+    ) -> Self {
+        Self {
+            sources,
+            destination,
+            from,
+            chown,
+            chmod,
+            link,
+            should_cache,
+            snapshot_files: Mutex::new(vec![]),
+            context_dir,
+            stages: HashMap::new(),
+        }
+    }
+
     /// Set the stages map for --from support
     pub fn with_stages(mut self, stages: HashMap<String, oci_image::mutate::MutableImage>) -> Self {
         self.stages = stages;
@@ -63,14 +88,14 @@ impl CopyCommand {
             }
 
             if src_path.is_dir() {
-                copy_dir_recursive(&src_path, Path::new(dest))?;
+                copy_dir_recursive(&src_path, Path::new(dest), &self.chown, &self.chmod)?;
             } else {
                 let dest_path = if dest.ends_with('/') || Path::new(dest).is_dir() {
                     PathBuf::from(dest).join(src_path.file_name().unwrap_or_default())
                 } else {
                     PathBuf::from(dest)
                 };
-                copy_file(&src_path, &dest_path)?;
+                copy_file(&src_path, &dest_path, &self.chown, &self.chmod)?;
             }
         }
         Ok(())
@@ -116,6 +141,9 @@ impl CopyCommand {
         // Create a placeholder file
         std::fs::write(&dest_path, format!("Copied from stage: {}", src))?;
         
+        // Apply --chown and --chmod to the extracted file
+        apply_permissions(&dest_path, &self.chown, &self.chmod)?;
+        
         Ok(())
     }
 }
@@ -124,7 +152,10 @@ impl CopyCommand {
 impl BaseCommand for CopyCommand {
     async fn execute_impl(&self, config: &mut ContainerConfig, _args: &BuildArgs) -> Result<()> {
         let dest = resolve_destination(&self.destination, config);
-        tracing::info!("COPY {:?} {}", self.sources, dest);
+        tracing::info!(
+            "COPY {:?} {} (chown={:?}, chmod={:?}, link={})",
+            self.sources, dest, self.chown, self.chmod, self.link
+        );
 
         if let Some(ref from_stage) = self.from {
             // COPY --from=stage support
@@ -138,8 +169,22 @@ impl BaseCommand for CopyCommand {
     }
 
     fn command_string_impl(&self) -> String {
-        let from_str = self.from.as_ref().map(|f| format!("--from={} ", f)).unwrap_or_default();
-        format!("COPY {}{} {}", from_str, self.sources.join(" "), self.destination)
+        let mut parts = Vec::new();
+        if let Some(ref f) = self.from {
+            parts.push(format!("--from={}", f));
+        }
+        if let Some(ref c) = self.chown {
+            parts.push(format!("--chown={}", c));
+        }
+        if let Some(ref c) = self.chmod {
+            parts.push(format!("--chmod={}", c));
+        }
+        if self.link {
+            parts.push("--link".to_string());
+        }
+        parts.extend(self.sources.iter().cloned());
+        parts.push(self.destination.clone());
+        format!("COPY {}", parts.join(" "))
     }
 
     fn metadata_only_impl(&self) -> bool {
@@ -173,15 +218,75 @@ fn resolve_destination(dest: &str, config: &ContainerConfig) -> String {
     }
 }
 
-fn copy_file(src: &Path, dest: &Path) -> Result<()> {
+/// Apply --chown and --chmod permissions to a file or directory.
+fn apply_permissions(path: &Path, chown: &Option<String>, chmod: &Option<String>) -> Result<()> {
+    if let Some(chmod_val) = chmod {
+        let mode = u32::from_str_radix(chmod_val, 8).map_err(|e| {
+            CommandError::Failed(format!("Invalid chmod value '{}': {}", chmod_val, e))
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+        }
+        #[cfg(not(unix))]
+        {
+            tracing::warn!("--chmod is not supported on non-Unix platforms");
+        }
+    }
+
+    if let Some(chown_val) = chown {
+        // Parse user:group format
+        let parts: Vec<&str> = chown_val.split(':').collect();
+        let uid: u32 = parts[0].parse().unwrap_or(0);
+        let gid: u32 = if parts.len() > 1 {
+            parts[1].parse().unwrap_or(0)
+        } else {
+            uid
+        };
+
+        #[cfg(unix)]
+        {
+            // Only change ownership if we're running as root
+            // In container builds, we typically run as root
+            if unsafe { libc::geteuid() } == 0 {
+                let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+                let ret = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
+                if ret != 0 {
+                    tracing::warn!(
+                        "Failed to chown {} to {}:{}: {}",
+                        path.display(), uid, gid,
+                        std::io::Error::last_os_error()
+                    );
+                    // Non-fatal: continue build even if chown fails
+                }
+            } else {
+                tracing::debug!(
+                    "Skipping chown for {} (not running as root)",
+                    path.display()
+                );
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tracing::warn!("--chown is not supported on non-Unix platforms (uid={}, gid={})", uid, gid);
+            let _ = (uid, gid); // suppress unused warnings
+        }
+    }
+
+    Ok(())
+}
+
+fn copy_file(src: &Path, dest: &Path, chown: &Option<String>, chmod: &Option<String>) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::copy(src, dest)?;
+    apply_permissions(dest, chown, chmod)?;
     Ok(())
 }
 
-fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
+fn copy_dir_recursive(src: &Path, dest: &Path, chown: &Option<String>, chmod: &Option<String>) -> Result<()> {
     let dest = dest.join(src.file_name().unwrap_or_default());
     for entry in walkdir::WalkDir::new(src) {
         let entry = entry?;
@@ -189,11 +294,13 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
         let target = dest.join(rel);
         if entry.file_type().is_dir() {
             std::fs::create_dir_all(&target)?;
+            apply_permissions(&target, chown, chmod)?;
         } else {
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::copy(entry.path(), &target)?;
+            apply_permissions(&target, chown, chmod)?;
         }
     }
     Ok(())
@@ -231,6 +338,26 @@ mod tests {
         );
         
         assert_eq!(command.command_string_impl(), "COPY --from=builder app /app");
+    }
+
+    #[tokio::test]
+    async fn test_copy_command_with_all_flags() {
+        let context_dir = PathBuf::from("/tmp");
+        let command = CopyCommand::with_flags(
+            vec!["app".to_string()],
+            "/app".to_string(),
+            Some("builder".to_string()),
+            Some("1000:1000".to_string()),
+            Some("755".to_string()),
+            true,
+            context_dir,
+            true,
+        );
+        
+        assert_eq!(
+            command.command_string_impl(),
+            "COPY --from=builder --chown=1000:1000 --chmod=755 --link app /app"
+        );
     }
 
     #[tokio::test]
@@ -285,5 +412,51 @@ mod tests {
         assert!(command.should_cache_output_impl());
         assert!(command.provides_files_to_snapshot_impl());
         assert!(command.files_to_snapshot_impl().is_none()); // Empty initially
+    }
+
+    #[test]
+    fn test_apply_permissions_chmod() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let file_path = tmp_dir.path().join("test.txt");
+        fs::write(&file_path, "test").unwrap();
+
+        // Test chmod
+        let result = apply_permissions(&file_path, &None, &Some("755".to_string()));
+        assert!(result.is_ok());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mode = fs::metadata(&file_path).unwrap().mode() & 0o777;
+            assert_eq!(mode, 0o755);
+        }
+    }
+
+    #[test]
+    fn test_apply_permissions_invalid_chmod() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let file_path = tmp_dir.path().join("test.txt");
+        fs::write(&file_path, "test").unwrap();
+
+        let result = apply_permissions(&file_path, &None, &Some("999".to_string()));
+        // 999 is not valid octal (9 is not an octal digit)
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_apply_permissions_chmod_644() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let file_path = tmp_dir.path().join("test.txt");
+        fs::write(&file_path, "test").unwrap();
+
+        let result = apply_permissions(&file_path, &None, &Some("644".to_string()));
+        assert!(result.is_ok());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mode = fs::metadata(&file_path).unwrap().mode() & 0o777;
+            assert_eq!(mode, 0o644);
+        }
     }
 }

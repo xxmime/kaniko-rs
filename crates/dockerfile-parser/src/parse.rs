@@ -284,25 +284,25 @@ pub fn parse_dockerfile_with_build_args(
             }
             "ADD" => {
                 let substituted = ctx.substitute(rest);
-                let (sources, dest) = parse_add(&substituted);
+                let (sources, dest, flags) = parse_add(&substituted);
                 add_instruction(&mut current_stage, Instruction::Add(AddInstruction {
                     sources,
                     destination: dest,
-                    chmod: None,
-                    chown: None,
-                    link: false,
+                    chmod: flags.chmod,
+                    chown: flags.chown,
+                    link: flags.link,
                 }), line_num)?;
             }
             "COPY" => {
                 let substituted = ctx.substitute(rest);
-                let (sources, dest, from) = parse_copy(&substituted);
+                let (sources, dest, flags) = parse_copy(&substituted);
                 add_instruction(&mut current_stage, Instruction::Copy(CopyInstruction {
                     sources,
                     destination: dest,
-                    from,
-                    chmod: None,
-                    chown: None,
-                    link: false,
+                    from: flags.from,
+                    chmod: flags.chmod,
+                    chown: flags.chown,
+                    link: flags.link,
                 }), line_num)?;
             }
             "ENTRYPOINT" => {
@@ -492,46 +492,48 @@ fn parse_arg(rest: &str) -> (String, Option<String>) {
     }
 }
 
-/// Parse ADD instruction.
-fn parse_add(rest: &str) -> (Vec<String>, String) {
-    let parts: Vec<&str> = rest.split_whitespace().collect();
-    if parts.len() < 2 {
-        return (vec![], String::new());
-    }
-    let dest = parts.last().unwrap().to_string();
-    let sources = parts[..parts.len() - 1].iter().map(|s| s.to_string()).collect();
-    (sources, dest)
+/// Parsed ADD flags (--chown, --chmod, --link).
+#[derive(Debug, Clone, Default)]
+struct AddFlags {
+    chown: Option<String>,
+    chmod: Option<String>,
+    link: bool,
 }
 
-/// Parse COPY instruction.
-fn parse_copy(rest: &str) -> (Vec<String>, String, Option<String>) {
+/// Parse ADD instruction, extracting all flags.
+fn parse_add(rest: &str) -> (Vec<String>, String, AddFlags) {
     let parts: Vec<&str> = rest.split_whitespace().collect();
     if parts.len() < 2 {
-        return (vec![], String::new(), None);
+        return (vec![], String::new(), AddFlags::default());
     }
     
     let mut sources = Vec::new();
     let mut dest = String::new();
-    let mut from = None;
+    let mut flags = AddFlags::default();
     let mut i = 0;
     
     while i < parts.len() {
         let part = parts[i];
-        if part.eq_ignore_ascii_case("--from") && i + 1 < parts.len() {
-            // --from builder (space-separated)
-            from = Some(parts[i + 1].to_string());
+        if part.eq_ignore_ascii_case("--chown") && i + 1 < parts.len() {
+            flags.chown = Some(parts[i + 1].to_string());
             i += 2;
-        } else if part.to_lowercase().starts_with("--from=") {
-            // --from=builder (equals-separated)
-            from = Some(part[7..].to_string());
+        } else if part.to_lowercase().starts_with("--chown=") {
+            flags.chown = Some(part[8..].to_string());
+            i += 1;
+        } else if part.eq_ignore_ascii_case("--chmod") && i + 1 < parts.len() {
+            flags.chmod = Some(parts[i + 1].to_string());
+            i += 2;
+        } else if part.to_lowercase().starts_with("--chmod=") {
+            flags.chmod = Some(part[8..].to_string());
+            i += 1;
+        } else if part.eq_ignore_ascii_case("--link") {
+            flags.link = true;
             i += 1;
         } else if part.starts_with("--") {
-            // Skip other flags like --chown, --chmod, --link
-            // For --chown=value and --chmod=value (equals form), just skip
+            // Skip unknown flags
             if part.contains('=') {
                 i += 1;
             } else if i + 1 < parts.len() {
-                // Skip flag and its value
                 i += 2;
             } else {
                 i += 1;
@@ -545,7 +547,72 @@ fn parse_copy(rest: &str) -> (Vec<String>, String, Option<String>) {
         }
     }
     
-    (sources, dest, from)
+    (sources, dest, flags)
+}
+
+/// Parsed COPY flags (--from, --chown, --chmod, --link).
+#[derive(Debug, Clone, Default)]
+struct CopyFlags {
+    from: Option<String>,
+    chown: Option<String>,
+    chmod: Option<String>,
+    link: bool,
+}
+
+/// Parse COPY instruction, extracting all flags.
+fn parse_copy(rest: &str) -> (Vec<String>, String, CopyFlags) {
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    if parts.len() < 2 {
+        return (vec![], String::new(), CopyFlags::default());
+    }
+    
+    let mut sources = Vec::new();
+    let mut dest = String::new();
+    let mut flags = CopyFlags::default();
+    let mut i = 0;
+    
+    while i < parts.len() {
+        let part = parts[i];
+        if part.eq_ignore_ascii_case("--from") && i + 1 < parts.len() {
+            flags.from = Some(parts[i + 1].to_string());
+            i += 2;
+        } else if part.to_lowercase().starts_with("--from=") {
+            flags.from = Some(part[7..].to_string());
+            i += 1;
+        } else if part.eq_ignore_ascii_case("--chown") && i + 1 < parts.len() {
+            flags.chown = Some(parts[i + 1].to_string());
+            i += 2;
+        } else if part.to_lowercase().starts_with("--chown=") {
+            flags.chown = Some(part[8..].to_string());
+            i += 1;
+        } else if part.eq_ignore_ascii_case("--chmod") && i + 1 < parts.len() {
+            flags.chmod = Some(parts[i + 1].to_string());
+            i += 2;
+        } else if part.to_lowercase().starts_with("--chmod=") {
+            flags.chmod = Some(part[8..].to_string());
+            i += 1;
+        } else if part.eq_ignore_ascii_case("--link") {
+            flags.link = true;
+            i += 1;
+        } else if part.starts_with("--") {
+            // Skip unknown flags
+            if part.contains('=') {
+                i += 1;
+            } else if i + 1 < parts.len() {
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else if i == parts.len() - 1 {
+            dest = parts[i].to_string();
+            break;
+        } else {
+            sources.push(parts[i].to_string());
+            i += 1;
+        }
+    }
+    
+    (sources, dest, flags)
 }
 
 /// Parse HEALTHCHECK instruction.
@@ -620,24 +687,24 @@ fn parse_onbuild(rest: &str) -> Result<Instruction> {
             is_shell_form: false,
         })),
         "COPY" => {
-            let (sources, dest, from) = parse_copy(inner_rest);
+            let (sources, dest, flags) = parse_copy(inner_rest);
             Ok(Instruction::Copy(CopyInstruction {
                 sources,
                 destination: dest,
-                from,
-                chmod: None,
-                chown: None,
-                link: false,
+                from: flags.from,
+                chmod: flags.chmod,
+                chown: flags.chown,
+                link: flags.link,
             }))
         }
         "ADD" => {
-            let (sources, dest) = parse_add(inner_rest);
+            let (sources, dest, flags) = parse_add(inner_rest);
             Ok(Instruction::Add(AddInstruction {
                 sources,
                 destination: dest,
-                chmod: None,
-                chown: None,
-                link: false,
+                chmod: flags.chmod,
+                chown: flags.chown,
+                link: flags.link,
             }))
         }
         _ => Err(ParseError::Syntax {
@@ -898,6 +965,103 @@ USER $USER_NAME
         match &stages[0].instructions[1] {
             Instruction::User(u) => assert_eq!(u.user, "appuser"),
             other => panic!("Expected USER, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_copy_with_chown_chmod_link() {
+        let dockerfile = r#"
+FROM ubuntu:20.04
+COPY --chown=1000:1000 --chmod=755 app /app
+COPY --chown=appuser --link src/ /src/
+"#;
+        let stages = parse_dockerfile(dockerfile).unwrap();
+        match &stages[0].instructions[0] {
+            Instruction::Copy(copy) => {
+                assert_eq!(copy.sources, vec!["app"]);
+                assert_eq!(copy.destination, "/app");
+                assert_eq!(copy.chown, Some("1000:1000".to_string()));
+                assert_eq!(copy.chmod, Some("755".to_string()));
+                assert!(!copy.link);
+            }
+            other => panic!("Expected COPY, got {:?}", other),
+        }
+        match &stages[0].instructions[1] {
+            Instruction::Copy(copy) => {
+                assert_eq!(copy.chown, Some("appuser".to_string()));
+                assert!(copy.chmod.is_none());
+                assert!(copy.link);
+            }
+            other => panic!("Expected COPY, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_copy_with_all_flags() {
+        let dockerfile = r#"
+FROM ubuntu:20.04
+COPY --from=builder --chown=app:app --chmod=644 --link /app/bin /usr/local/bin
+"#;
+        let stages = parse_dockerfile(dockerfile).unwrap();
+        match &stages[0].instructions[0] {
+            Instruction::Copy(copy) => {
+                assert_eq!(copy.from, Some("builder".to_string()));
+                assert_eq!(copy.chown, Some("app:app".to_string()));
+                assert_eq!(copy.chmod, Some("644".to_string()));
+                assert!(copy.link);
+                assert_eq!(copy.sources, vec!["/app/bin"]);
+                assert_eq!(copy.destination, "/usr/local/bin");
+            }
+            other => panic!("Expected COPY, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_add_with_chown_chmod() {
+        let dockerfile = r#"
+FROM ubuntu:20.04
+ADD --chown=root:root --chmod=755 script.sh /usr/bin/
+ADD --link archive.tar.gz /opt/
+"#;
+        let stages = parse_dockerfile(dockerfile).unwrap();
+        match &stages[0].instructions[0] {
+            Instruction::Add(add) => {
+                assert_eq!(add.chown, Some("root:root".to_string()));
+                assert_eq!(add.chmod, Some("755".to_string()));
+                assert!(!add.link);
+            }
+            other => panic!("Expected ADD, got {:?}", other),
+        }
+        match &stages[0].instructions[1] {
+            Instruction::Add(add) => {
+                assert!(add.chown.is_none());
+                assert!(add.chmod.is_none());
+                assert!(add.link);
+            }
+            other => panic!("Expected ADD, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_copy_chmod_equals_form() {
+        let dockerfile = r#"
+FROM ubuntu:20.04
+COPY --chmod=755 app /app
+COPY --chown=1000:1000 --chmod=644 file /etc/file
+"#;
+        let stages = parse_dockerfile(dockerfile).unwrap();
+        match &stages[0].instructions[0] {
+            Instruction::Copy(copy) => {
+                assert_eq!(copy.chmod, Some("755".to_string()));
+            }
+            other => panic!("Expected COPY, got {:?}", other),
+        }
+        match &stages[0].instructions[1] {
+            Instruction::Copy(copy) => {
+                assert_eq!(copy.chown, Some("1000:1000".to_string()));
+                assert_eq!(copy.chmod, Some("644".to_string()));
+            }
+            other => panic!("Expected COPY, got {:?}", other),
         }
     }
 }
