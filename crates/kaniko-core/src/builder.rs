@@ -46,8 +46,20 @@ pub struct BuildOptions {
     pub single_snapshot: bool,
     /// Whether to force build metadata.
     pub force_build_metadata: bool,
-    /// Snapshot mode: "full" or "redo".
+    /// Snapshot mode: "full", "redo", or "time".
     pub snapshot_mode: String,
+    /// Whether to cache COPY layers.
+    pub cache_copy_layers: bool,
+    /// Whether to cache RUN layers.
+    pub cache_run_layers: bool,
+    /// Whether to use RunV2 (RunMarkerCommand).
+    pub run_v2: bool,
+    /// Compression algorithm for layers.
+    pub compression: Option<String>,
+    /// Compression level (0-9).
+    pub compression_level: u32,
+    /// Whether to use compressed caching.
+    pub compressed_caching: bool,
 }
 
 impl Default for BuildOptions {
@@ -58,6 +70,12 @@ impl Default for BuildOptions {
             single_snapshot: false,
             force_build_metadata: false,
             snapshot_mode: "full".to_string(),
+            cache_copy_layers: false,
+            cache_run_layers: false,
+            run_v2: false,
+            compression: None,
+            compression_level: 0,
+            compressed_caching: false,
         }
     }
 }
@@ -221,6 +239,14 @@ impl StageBuilder {
                 continue;
             }
 
+            // Determine if we should take a snapshot.
+            // Analogous to Go: `stageBuilder.shouldTakeSnapshot(index, isMetadataCmd)`.
+            let is_last_command = index == self.commands.len() - 1;
+            if !self.should_take_snapshot(index, is_last_command, command.metadata_only()) {
+                tracing::debug!("Skipping snapshot for: {}", cmd_str);
+                continue;
+            }
+
             // Take snapshot
             if self.opts.single_snapshot {
                 // Defer snapshot to the end
@@ -353,6 +379,28 @@ impl StageBuilder {
                 label_map.insert(key.clone(), value.clone());
             }
         }
+    }
+
+    /// Determine whether a snapshot should be taken after a command.
+    ///
+    /// Analogous to Go: `stageBuilder.shouldTakeSnapshot(index, isMetadataCmd)`.
+    ///
+    /// Rules:
+    /// - In single snapshot mode, only snapshot the very last command.
+    /// - If caching is enabled, always take snapshots.
+    /// - Skip metadata-only commands unless it's the last command.
+    fn should_take_snapshot(&self, index: usize, is_last_command: bool, is_metadata_cmd: bool) -> bool {
+        if self.opts.single_snapshot {
+            return is_last_command;
+        }
+
+        // Always take snapshots if caching is enabled
+        if self.opts.cache {
+            return true;
+        }
+
+        // Skip metadata-only commands (unless it's the last command or forced)
+        !is_metadata_cmd
     }
 }
 
