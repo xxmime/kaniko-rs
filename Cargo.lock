@@ -1002,6 +1002,7 @@ dependencies = [
 name = "kaniko-cli"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "dockerfile-parser",
  "kaniko-core",
@@ -1009,6 +1010,8 @@ dependencies = [
  "kaniko-snapshot",
  "oci-image",
  "oci-registry",
+ "reqwest",
+ "serde",
  "serde_json",
  "tar",
  "tokio",

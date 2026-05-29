@@ -173,6 +173,95 @@ impl MediaType {
         media_type == Self::IMAGE_MANIFEST_LIST_V2S2
             || media_type == Self::OCI_IMAGE_INDEX_V1
     }
+
+    /// Extract the vendor prefix from a media type.
+    ///
+    /// Returns "docker" or "oci" depending on the vendor.
+    /// Analogous to Go: `executor.extractMediaTypeVendor()`.
+    pub fn extract_vendor_prefix(media_type: &str) -> &'static str {
+        if media_type.contains("oci") {
+            "oci"
+        } else {
+            "docker"
+        }
+    }
+
+    /// Convert a layer media type between Docker and OCI formats.
+    ///
+    /// This is needed when the image being built uses a different format
+    /// than the base image layers. For example, when building an OCI
+    /// image from a Docker base image, layers need to be converted.
+    ///
+    /// Analogous to Go: `executor.convertMediaType()`.
+    /// Reference: <https://github.com/opencontainers/image-spec/blob/main/media-types.md#compatibility-matrix>
+    pub fn convert_layer_media_type(media_type: &str, target_vendor: &str, use_zstd: bool) -> Option<String> {
+        let current_vendor = Self::extract_vendor_prefix(media_type);
+        if current_vendor == target_vendor {
+            // Same vendor, no conversion needed (unless zstd is requested)
+            if target_vendor == "oci" && use_zstd {
+                return Some(Self::LAYER_OCI_V1_TAR_ZSTD.to_string());
+            }
+            return Some(media_type.to_string());
+        }
+
+        match media_type {
+            // Docker → OCI
+            Self::LAYER_DOCKER_V2_TAR => {
+                if use_zstd {
+                    Some(Self::LAYER_OCI_V1_TAR_ZSTD.to_string())
+                } else {
+                    Some(Self::LAYER_OCI_V1_TAR.to_string())
+                }
+            }
+            Self::LAYER_DOCKER_V2_TAR_GZIP => {
+                if use_zstd {
+                    Some(Self::LAYER_OCI_V1_TAR_ZSTD.to_string())
+                } else {
+                    Some(Self::LAYER_OCI_V1_TAR_GZIP.to_string())
+                }
+            }
+            Self::LAYER_DOCKER_V2_TAR_ZSTD => {
+                Some(Self::LAYER_OCI_V1_TAR_ZSTD.to_string())
+            }
+
+            // OCI → Docker
+            Self::LAYER_OCI_V1_TAR => {
+                Some(Self::LAYER_DOCKER_V2_TAR.to_string())
+            }
+            Self::LAYER_OCI_V1_TAR_GZIP => {
+                Some(Self::LAYER_DOCKER_V2_TAR_GZIP.to_string())
+            }
+            Self::LAYER_OCI_V1_TAR_ZSTD => {
+                Some(Self::LAYER_DOCKER_V2_TAR_ZSTD.to_string())
+            }
+
+            _ => None,
+        }
+    }
+
+    /// Convert a manifest-level media type between Docker and OCI formats.
+    ///
+    /// Analogous to Go: `executor.convertMediaType()`.
+    pub fn convert_manifest_media_type(media_type: &str) -> Option<String> {
+        match media_type {
+            // Docker → OCI
+            Self::IMAGE_MANIFEST_V1S2 => Some(Self::OCI_IMAGE_MANIFEST_V1.to_string()),
+            Self::IMAGE_MANIFEST_LIST_V2S2 => Some(Self::OCI_IMAGE_INDEX_V1.to_string()),
+            Self::LAYER_DOCKER_V2_TAR => Some(Self::LAYER_OCI_V1_TAR.to_string()),
+            Self::LAYER_DOCKER_V2_TAR_GZIP => Some(Self::LAYER_OCI_V1_TAR_GZIP.to_string()),
+            Self::IMAGE_CONFIG => Some(Self::OCI_IMAGE_CONFIG_V1.to_string()),
+
+            // OCI → Docker
+            Self::OCI_IMAGE_MANIFEST_V1 => Some(Self::IMAGE_MANIFEST_V1S2.to_string()),
+            Self::OCI_IMAGE_INDEX_V1 => Some(Self::IMAGE_MANIFEST_LIST_V2S2.to_string()),
+            Self::OCI_IMAGE_CONFIG_V1 => Some(Self::IMAGE_CONFIG.to_string()),
+            Self::LAYER_OCI_V1_TAR => Some(Self::LAYER_DOCKER_V2_TAR.to_string()),
+            Self::LAYER_OCI_V1_TAR_GZIP => Some(Self::LAYER_DOCKER_V2_TAR_GZIP.to_string()),
+            Self::LAYER_OCI_V1_TAR_ZSTD => Some(Self::LAYER_DOCKER_V2_TAR_ZSTD.to_string()),
+
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for MediaType {
@@ -205,5 +294,58 @@ mod tests {
         assert!(MediaType::is_compressed(MediaType::LAYER_DOCKER_V2_TAR_GZIP));
         assert!(MediaType::is_compressed(MediaType::LAYER_OCI_V1_TAR_GZIP));
         assert!(!MediaType::is_compressed(MediaType::LAYER_OCI_V1_TAR));
+    }
+
+    #[test]
+    fn test_extract_vendor_prefix() {
+        assert_eq!(MediaType::extract_vendor_prefix(MediaType::LAYER_DOCKER_V2_TAR_GZIP), "docker");
+        assert_eq!(MediaType::extract_vendor_prefix(MediaType::LAYER_OCI_V1_TAR_GZIP), "oci");
+        assert_eq!(MediaType::extract_vendor_prefix(MediaType::OCI_IMAGE_MANIFEST_V1), "oci");
+        assert_eq!(MediaType::extract_vendor_prefix(MediaType::IMAGE_MANIFEST_V1S2), "docker");
+    }
+
+    #[test]
+    fn test_convert_layer_media_type_docker_to_oci() {
+        let result = MediaType::convert_layer_media_type(
+            MediaType::LAYER_DOCKER_V2_TAR_GZIP, "oci", false);
+        assert_eq!(result, Some(MediaType::LAYER_OCI_V1_TAR_GZIP.to_string()));
+
+        let result = MediaType::convert_layer_media_type(
+            MediaType::LAYER_DOCKER_V2_TAR, "oci", true);
+        assert_eq!(result, Some(MediaType::LAYER_OCI_V1_TAR_ZSTD.to_string()));
+    }
+
+    #[test]
+    fn test_convert_layer_media_type_oci_to_docker() {
+        let result = MediaType::convert_layer_media_type(
+            MediaType::LAYER_OCI_V1_TAR_GZIP, "docker", false);
+        assert_eq!(result, Some(MediaType::LAYER_DOCKER_V2_TAR_GZIP.to_string()));
+
+        let result = MediaType::convert_layer_media_type(
+            MediaType::LAYER_OCI_V1_TAR_ZSTD, "docker", false);
+        assert_eq!(result, Some(MediaType::LAYER_DOCKER_V2_TAR_ZSTD.to_string()));
+    }
+
+    #[test]
+    fn test_convert_layer_same_vendor() {
+        let result = MediaType::convert_layer_media_type(
+            MediaType::LAYER_OCI_V1_TAR_GZIP, "oci", false);
+        assert_eq!(result, Some(MediaType::LAYER_OCI_V1_TAR_GZIP.to_string()));
+    }
+
+    #[test]
+    fn test_convert_manifest_media_type() {
+        assert_eq!(
+            MediaType::convert_manifest_media_type(MediaType::IMAGE_MANIFEST_V1S2),
+            Some(MediaType::OCI_IMAGE_MANIFEST_V1.to_string())
+        );
+        assert_eq!(
+            MediaType::convert_manifest_media_type(MediaType::OCI_IMAGE_MANIFEST_V1),
+            Some(MediaType::IMAGE_MANIFEST_V1S2.to_string())
+        );
+        assert_eq!(
+            MediaType::convert_manifest_media_type(MediaType::IMAGE_CONFIG),
+            Some(MediaType::OCI_IMAGE_CONFIG_V1.to_string())
+        );
     }
 }

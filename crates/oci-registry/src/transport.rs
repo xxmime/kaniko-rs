@@ -1,5 +1,13 @@
 //! HTTP transport with retry logic and TLS configuration for registry operations.
+//!
+//! Supports:
+//! - Per-registry TLS skip/insecure settings
+//! - Registry mirrors (pull-through cache)
+//! - Custom CA certificates
+//! - Exponential backoff retry
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -9,6 +17,67 @@ pub enum TransportError {
     Http(#[from] reqwest::Error),
     #[error("max retries exceeded for {url}: last error: {last_error}")]
     MaxRetries { url: String, last_error: String },
+    #[error("certificate error: {0}")]
+    Certificate(String),
+    #[error("invalid configuration: {0}")]
+    Config(String),
+}
+
+/// Registry-specific configuration options.
+/// Analogous to Go: `config.RegistryOptions`.
+#[derive(Debug, Clone, Default)]
+pub struct RegistryOptions {
+    /// Registries that should use insecure (HTTP) connections.
+    pub insecure_registries: Vec<String>,
+    /// Registries where TLS verification should be skipped.
+    pub skip_tls_verify_registries: Vec<String>,
+    /// Registry mirrors for pull-through caching (e.g. "docker.io" -> "mirror.example.com").
+    pub registry_mirrors: HashMap<String, Vec<String>>,
+    /// Skip default registry fallback when mirrors don't have the image.
+    pub skip_default_registry_fallback: bool,
+    /// Path to CA certificates per registry (registry -> cert_path).
+    pub registry_certificates: HashMap<String, PathBuf>,
+    /// Path to client certificates per registry (registry -> "cert_path,key_path").
+    pub registry_client_certificates: HashMap<String, String>,
+}
+
+impl RegistryOptions {
+    /// Create a new empty RegistryOptions.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Check if a registry should use insecure (HTTP) connection.
+    pub fn is_insecure(&self, registry: &str) -> bool {
+        self.insecure_registries.iter().any(|r| r.eq_ignore_ascii_case(registry))
+    }
+
+    /// Check if TLS verification should be skipped for a registry.
+    pub fn should_skip_tls_verify(&self, registry: &str) -> bool {
+        self.skip_tls_verify_registries.iter().any(|r| r.eq_ignore_ascii_case(registry))
+    }
+
+    /// Get the mirror URL for a registry, if configured.
+    /// Returns the first mirror that is configured.
+    /// Analogous to Go: `util.MakeTransport()` mirror resolution.
+    pub fn get_mirror(&self, registry: &str) -> Option<&str> {
+        self.registry_mirrors
+            .get(registry)
+            .and_then(|mirrors| mirrors.first())
+            .map(|s| s.as_str())
+    }
+
+    /// Remap a registry reference to its mirror if configured.
+    /// Returns the original reference if no mirror is configured.
+    pub fn remap_reference(&self, reference: &str) -> String {
+        // Parse "registry/repo:tag" format
+        if let Some((host, _rest)) = reference.split_once('/') {
+            if let Some(mirror) = self.get_mirror(host) {
+                return reference.replacen(host, mirror, 1);
+            }
+        }
+        reference.to_string()
+    }
 }
 
 /// Retry configuration for HTTP requests.
