@@ -92,9 +92,13 @@ impl CopyCommand {
 
             let metadata = std::fs::symlink_metadata(&src_path)?;
             if metadata.is_dir() {
-                copy_dir_recursive(&src_path, Path::new(&resolved_dest), &self.chown, &self.chmod)?;
+                if self.link {
+                    copy_dir_recursive_link(&src_path, Path::new(&resolved_dest), &self.chown, &self.chmod)?;
+                } else {
+                    copy_dir_recursive(&src_path, Path::new(&resolved_dest), &self.chown, &self.chmod)?;
+                }
             } else if metadata.file_type().is_symlink() {
-                // Copy symlink target
+                // Copy symlink target (--link doesn't apply to symlinks)
                 let link_target = std::fs::read_link(&src_path)?;
                 let dest_path = if resolved_dest.ends_with('/') || Path::new(&resolved_dest).is_dir() {
                     PathBuf::from(&resolved_dest).join(src_path.file_name().unwrap_or_default())
@@ -104,14 +108,12 @@ impl CopyCommand {
                 if let Some(parent) = dest_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                // Copy the symlink itself
                 #[cfg(unix)]
                 {
                     std::os::unix::fs::symlink(&link_target, &dest_path)?;
                 }
                 #[cfg(not(unix))]
                 {
-                    // On non-Unix, copy the target file instead
                     let real_src = if link_target.is_absolute() {
                         link_target
                     } else {
@@ -128,7 +130,11 @@ impl CopyCommand {
                 } else {
                     PathBuf::from(&resolved_dest)
                 };
-                copy_file(&src_path, &dest_path, &self.chown, &self.chmod)?;
+                if self.link {
+                    copy_file_link(&src_path, &dest_path, &self.chown, &self.chmod)?;
+                } else {
+                    copy_file(&src_path, &dest_path, &self.chown, &self.chmod)?;
+                }
             }
         }
         Ok(())
@@ -431,6 +437,68 @@ fn copy_dir_recursive(src: &Path, dest: &Path, chown: &Option<String>, chmod: &O
         } else {
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(entry.path(), &target)?;
+            apply_permissions(&target, chown, chmod)?;
+        }
+    }
+    Ok(())
+}
+
+/// Copy a file using a hard link (--link mode).
+/// Falls back to regular copy if hard link fails (e.g., cross-device).
+fn copy_file_link(src: &Path, dest: &Path, chown: &Option<String>, chmod: &Option<String>) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Try hard link first
+    #[cfg(unix)]
+    {
+        match std::fs::hard_link(src, dest) {
+            Ok(()) => {
+                tracing::debug!("Hard linked {} -> {}", src.display(), dest.display());
+                // Note: --chown may not work on hard links (same inode)
+                // but --chmod will affect the link independently on some systems
+                apply_permissions(dest, chown, chmod)?;
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::debug!("Hard link failed ({}), falling back to copy: {} -> {}", e, src.display(), dest.display());
+            }
+        }
+    }
+    // Fallback to copy
+    std::fs::copy(src, dest)?;
+    apply_permissions(dest, chown, chmod)?;
+    Ok(())
+}
+
+/// Copy a directory recursively using hard links (--link mode).
+fn copy_dir_recursive_link(src: &Path, dest: &Path, chown: &Option<String>, chmod: &Option<String>) -> Result<()> {
+    let dest = dest.join(src.file_name().unwrap_or_default());
+    for entry in walkdir::WalkDir::new(src) {
+        let entry = entry?;
+        let rel = entry.path().strip_prefix(src).unwrap_or(entry.path());
+        let target = dest.join(rel);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&target)?;
+            apply_permissions(&target, chown, chmod)?;
+        } else {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // Try hard link, fallback to copy
+            #[cfg(unix)]
+            {
+                match std::fs::hard_link(entry.path(), &target) {
+                    Ok(()) => {
+                        apply_permissions(&target, chown, chmod)?;
+                        continue;
+                    }
+                    Err(_) => {
+                        tracing::debug!("Hard link failed for {}, falling back to copy", target.display());
+                    }
+                }
             }
             std::fs::copy(entry.path(), &target)?;
             apply_permissions(&target, chown, chmod)?;
