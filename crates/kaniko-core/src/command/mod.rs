@@ -192,8 +192,12 @@ mod stopsignal;
 mod healthcheck;
 mod onbuild;
 mod base;
+mod cache_command;
+mod mount;
 
 pub use base::BaseCommand;
+pub use cache_command::{CachingCopyCommand, CachingRunCommand};
+pub use mount::{MountSpec, MountType, NetworkMode, parse_mount, parse_network, apply_mount};
 pub use env::EnvCommand;
 pub use label::LabelCommand;
 pub use expose::ExposeCommand;

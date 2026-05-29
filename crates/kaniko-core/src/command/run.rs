@@ -1,8 +1,10 @@
 //! RUN command implementation.
 //!
 //! RUN executes commands in a shell or exec form, producing a new layer.
+//! Supports BuildKit extensions: --mount (bind/cache/tmpfs/secret) and --network.
 
 use crate::command::base::BaseCommand;
+use crate::command::mount::{apply_mount, parse_mount, parse_network};
 use crate::command::{BuildArgs, CommandError, Result};
 use async_trait::async_trait;
 use oci_image::config::ContainerConfig;
@@ -16,11 +18,11 @@ pub struct RunCommand {
     is_exec_form: bool,
     /// Shell to use when not in exec form (default: ["/bin/sh", "-c"]).
     shell: Option<Vec<String>>,
-    /// Whether this is a mount-based RUN (--mount flag).
+    /// Mount specifications (--mount flags).
     mounts: Vec<String>,
     /// Whether to cache this layer.
     should_cache: bool,
-    /// Network mode for the RUN command.
+    /// Network mode for the RUN command (--network flag).
     network: Option<String>,
 }
 
@@ -55,6 +57,21 @@ impl RunCommand {
 #[async_trait]
 impl BaseCommand for RunCommand {
     async fn execute_impl(&self, config: &mut ContainerConfig, _args: &BuildArgs) -> Result<()> {
+        // Apply mount specifications before running the command
+        for mount_spec in &self.mounts {
+            let mount = parse_mount(mount_spec)?;
+            apply_mount(&mount)?;
+            tracing::info!("Applied RUN --mount: type={}, target={}", mount.mount_type, mount.target);
+        }
+
+        // Parse network mode (for logging; actual network isolation is limited in kaniko)
+        if let Some(ref network) = self.network {
+            let net_mode = parse_network(network)?;
+            tracing::info!("RUN --network={}", net_mode);
+            // Note: kaniko runs as a daemon-less builder, so network isolation
+            // is limited. We log the mode but can't fully enforce it.
+        }
+
         let cmd_str = if self.is_exec_form {
             format!("{:?}", self.command)
         } else {
@@ -101,11 +118,19 @@ impl BaseCommand for RunCommand {
     }
 
     fn command_string_impl(&self) -> String {
-        if self.is_exec_form {
-            format!("RUN {:?}", self.command)
-        } else {
-            format!("RUN {}", self.command.first().unwrap_or(&String::new()))
+        let mut parts = Vec::new();
+        for mount in &self.mounts {
+            parts.push(format!("--mount={}", mount));
         }
+        if let Some(ref network) = self.network {
+            parts.push(format!("--network={}", network));
+        }
+        if self.is_exec_form {
+            parts.push(format!("{:?}", self.command));
+        } else {
+            parts.push(self.command.first().cloned().unwrap_or_default());
+        }
+        format!("RUN {}", parts.join(" "))
     }
 
     fn metadata_only_impl(&self) -> bool { false }

@@ -59,6 +59,12 @@ pub struct FromInstruction {
 pub struct RunInstruction {
     pub command: String,
     pub is_shell_form: bool,
+    /// For exec form, the parsed arguments. For shell form, this is empty.
+    pub args: Vec<String>,
+    /// Mount specifications (--mount flags, BuildKit extension).
+    pub mounts: Vec<String>,
+    /// Network mode (--network flag, BuildKit extension).
+    pub network: Option<String>,
 }
 
 /// CMD instruction.

@@ -162,13 +162,25 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     c.execute(&mut container_config, &build_args).await
                 }
                 dockerfile_parser::Instruction::Run(run) => {
-                    let c = if run.is_shell_form {
+                    let mut c = if run.is_shell_form {
                         RunCommand::new_shell(run.command.clone(), cli.cache)
                     } else {
-                        // Exec form: split command by spaces for simple parsing
-                        let args: Vec<String> = run.command.split_whitespace().map(String::from).collect();
+                        // Exec form: use pre-parsed args (properly handles JSON arrays)
+                        let args = if run.args.is_empty() {
+                            run.command.split_whitespace().map(String::from).collect()
+                        } else {
+                            run.args.clone()
+                        };
                         RunCommand::new_exec(args, cli.cache)
                     };
+                    // Apply --mount flags
+                    for mount in &run.mounts {
+                        c = c.with_mount(mount.clone());
+                    }
+                    // Apply --network flag
+                    if let Some(network) = &run.network {
+                        c = c.with_network(network.clone());
+                    }
                     c.execute(&mut container_config, &build_args).await
                 }
                 dockerfile_parser::Instruction::Cmd(cmd) => {

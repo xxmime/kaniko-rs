@@ -257,11 +257,20 @@ pub fn parse_dockerfile_with_build_args(
                 add_instruction(&mut current_stage, instr, line_num)?;
             }
             "RUN" => {
-                let cmd = ctx.substitute(rest.trim());
+                let (mounts, network, cmd_raw) = parse_run_flags(rest.trim());
+                let cmd = ctx.substitute(&cmd_raw);
                 let is_shell = !cmd.starts_with('[');
+                let args = if !is_shell {
+                    parse_string_list(&cmd)
+                } else {
+                    vec![]
+                };
                 add_instruction(&mut current_stage, Instruction::Run(RunInstruction {
                     command: cmd,
                     is_shell_form: is_shell,
+                    args,
+                    mounts,
+                    network,
                 }), line_num)?;
             }
             "CMD" => {
@@ -681,6 +690,9 @@ fn parse_onbuild(rest: &str) -> Result<Instruction> {
         "RUN" => Ok(Instruction::Run(RunInstruction {
             command: inner_rest.trim().to_string(),
             is_shell_form: true,
+            args: vec![],
+            mounts: vec![],
+            network: None,
         })),
         "CMD" => Ok(Instruction::Cmd(CmdInstruction {
             command: parse_string_list(inner_rest),
@@ -1063,5 +1075,122 @@ COPY --chown=1000:1000 --chmod=644 file /etc/file
             }
             other => panic!("Expected COPY, got {:?}", other),
         }
+    }
+}
+
+/// Parse RUN flags (--mount, --network) from a RUN command string.
+/// Returns (mounts, network, remaining_command).
+fn parse_run_flags(input: &str) -> (Vec<String>, Option<String>, String) {
+    let mut mounts = Vec::new();
+    let mut network = None;
+    let mut remaining = String::new();
+    let mut chars = input.chars().peekable();
+    let mut current_token = String::new();
+    let mut in_flag_value = false;
+    let mut flag_name = String::new();
+
+    while let Some(ch) = chars.next() {
+        if in_flag_value {
+            if ch.is_whitespace() {
+                // End of flag value
+                if flag_name == "mount" {
+                    mounts.push(current_token.trim().to_string());
+                } else if flag_name == "network" {
+                    network = Some(current_token.trim().to_string());
+                }
+                current_token.clear();
+                flag_name.clear();
+                in_flag_value = false;
+                continue;
+            }
+            current_token.push(ch);
+            continue;
+        }
+
+        if ch == '-' && chars.peek() == Some(&'-') {
+            chars.next(); // consume second '-'
+            if !current_token.is_empty() {
+                if !remaining.is_empty() {
+                    remaining.push(' ');
+                }
+                remaining.push_str(&current_token);
+                current_token.clear();
+            }
+            let mut name = String::new();
+            while let Some(&c) = chars.peek() {
+                if c == '=' || c.is_whitespace() {
+                    break;
+                }
+                name.push(chars.next().unwrap());
+            }
+            if chars.peek() == Some(&'=') {
+                chars.next();
+                flag_name = name;
+                in_flag_value = true;
+                current_token.clear();
+            } else {
+                if !remaining.is_empty() {
+                    remaining.push(' ');
+                }
+                remaining.push_str(&format!("--{}", name));
+            }
+            continue;
+        }
+
+        current_token.push(ch);
+    }
+
+    if in_flag_value {
+        if flag_name == "mount" {
+            mounts.push(current_token.trim().to_string());
+        } else if flag_name == "network" {
+            network = Some(current_token.trim().to_string());
+        }
+    } else if !current_token.is_empty() {
+        if !remaining.is_empty() {
+            remaining.push(' ');
+        }
+        remaining.push_str(&current_token);
+    }
+
+    (mounts, network, remaining)
+}
+
+#[cfg(test)]
+mod tests_run_flags {
+    use super::*;
+
+    #[test]
+    fn test_parse_run_flags_no_flags() {
+        let (mounts, network, cmd) = parse_run_flags("apt-get install -y curl");
+        assert!(mounts.is_empty());
+        assert!(network.is_none());
+        assert_eq!(cmd, "apt-get install -y curl");
+    }
+
+    #[test]
+    fn test_parse_run_flags_mount() {
+        let (mounts, network, cmd) = parse_run_flags("--mount=type=cache,target=/root/.cache,id=npm pip install");
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0], "type=cache,target=/root/.cache,id=npm");
+        assert!(network.is_none());
+        assert_eq!(cmd, "pip install");
+    }
+
+    #[test]
+    fn test_parse_run_flags_network() {
+        let (mounts, network, cmd) = parse_run_flags("--network=none apt-get update");
+        assert!(mounts.is_empty());
+        assert_eq!(network, Some("none".to_string()));
+        assert_eq!(cmd, "apt-get update");
+    }
+
+    #[test]
+    fn test_parse_run_flags_both() {
+        let (mounts, network, cmd) = parse_run_flags("--mount=type=bind,source=/app,target=/app --network=host make build");
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0], "type=bind,source=/app,target=/app");
+        assert_eq!(network, Some("host".to_string()));
+        assert_eq!(cmd, "make build");
     }
 }

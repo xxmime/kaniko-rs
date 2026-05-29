@@ -146,37 +146,93 @@ impl CopyCommand {
         Ok(())
     }
 
-    fn copy_file_from_image(&self, _image: &oci_image::mutate::MutableImage, src: &str, dest: &str) -> Result<()> {
-        // For now, implement a basic version that extracts from the last layer
-        // In a full implementation, we would need to extract from all layers and merge
-        
-        // Find files matching the source pattern in the image layers
-        // This is a simplified implementation - in practice we'd need to:
-        // 1. Extract all layers in order
-        // 2. Find files matching the source pattern
-        // 3. Copy them to the destination
-        
+    fn copy_file_from_image(&self, image: &oci_image::mutate::MutableImage, src: &str, dest: &str) -> Result<()> {
         tracing::info!("Copying '{}' from stage to '{}'", src, dest);
-        
-        // Placeholder implementation - in a real implementation,
-        // we would extract files from the image layers
-        // For now, we'll create a dummy file to indicate the copy happened
-        let dest_path = if dest.ends_with('/') {
-            PathBuf::from(dest).join(Path::new(src).file_name().unwrap_or_default())
-        } else {
-            PathBuf::from(dest)
-        };
-        
-        if let Some(parent) = dest_path.parent() {
-            std::fs::create_dir_all(parent)?;
+
+        // Build a merged filesystem view from all layers in order.
+        // Each layer may add, modify, or delete files (via whiteout entries).
+        // We walk through all layers and collect the final state of files
+        // matching the source pattern.
+        let mut matched_files: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+        let src_path = PathBuf::from(src);
+
+        for layer in &image.layers {
+            let tar_data = layer.uncompressed_data()
+                .map_err(|e| CommandError::Failed(format!("decompress layer: {}", e)))?;
+
+            let mut archive = tar::Archive::new(tar_data.as_slice());
+            let entries = archive.entries()
+                .map_err(|e| CommandError::Failed(format!("read tar entries: {}", e)))?;
+
+            for entry in entries {
+                let mut entry = entry.map_err(|e| CommandError::Failed(format!("read tar entry: {}", e)))?;
+                let path = entry.path().map_err(|e| CommandError::Failed(format!("get entry path: {}", e)))?;
+                let path_str = path.to_string_lossy().to_string();
+                let path_buf = path.to_path_buf();
+
+                // Handle whiteout entries (file deletions)
+                if let Some(whiteout_name) = path_str.strip_prefix(".wh.") {
+                    // Remove the corresponding file from matched_files
+                    let deleted_path = PathBuf::from(whiteout_name);
+                    matched_files.retain(|(p, _)| p != &deleted_path);
+                    continue;
+                }
+                // Handle opaque whiteout directories (.wh..wh..opq)
+                if path_str.contains(".wh..wh..opq") {
+                    let parent = path_buf.parent().unwrap_or(Path::new(""));
+                    matched_files.retain(|(p, _)| !p.starts_with(parent));
+                    continue;
+                }
+
+                // Check if this path matches our source pattern
+                // Support exact match and glob-like prefix matching
+                let matches = if src_path.is_absolute() {
+                    path_buf.as_os_str() == src_path.as_os_str()
+                        || path_buf.starts_with(&src_path)
+                } else {
+                    // Relative source: match against the end of the path
+                    let file_name = path_buf.file_name().map(|f| f.to_string_lossy().to_string());
+                    file_name.as_deref() == Some(src)
+                        || path_str.ends_with(&format!("/{}", src))
+                };
+
+                if matches {
+                    let mut data = Vec::new();
+                    use std::io::Read;
+                    entry.read_to_end(&mut data)
+                        .map_err(|e| CommandError::Failed(format!("read entry data: {}", e)))?;
+                    matched_files.push((path_buf, data));
+                }
+            }
         }
-        
-        // Create a placeholder file
-        std::fs::write(&dest_path, format!("Copied from stage: {}", src))?;
-        
-        // Apply --chown and --chmod to the extracted file
-        apply_permissions(&dest_path, &self.chown, &self.chmod)?;
-        
+
+        if matched_files.is_empty() {
+            return Err(CommandError::Failed(format!(
+                "COPY --from: source '{}' not found in stage layers", src
+            )));
+        }
+
+        // Write matched files to destination
+        let dest_path = PathBuf::from(dest);
+        for (file_path, data) in &matched_files {
+            let target = if dest.ends_with('/') || dest_path.is_dir() {
+                dest_path.join(file_path.file_name().unwrap_or_default())
+            } else if matched_files.len() == 1 {
+                dest_path.clone()
+            } else {
+                dest_path.join(file_path.file_name().unwrap_or_default())
+            };
+
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&target, data)?;
+            apply_permissions(&target, &self.chown, &self.chmod)?;
+
+            let mut files = self.snapshot_files.lock().unwrap();
+            files.push(target);
+        }
+
         Ok(())
     }
 }
