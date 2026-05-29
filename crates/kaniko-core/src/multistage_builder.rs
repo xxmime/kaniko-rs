@@ -303,10 +303,75 @@ impl MultiStageBuilder {
         
         Ok(())
     }
-}
 
-#[cfg(test)]
-mod tests {
+    /// Calculate cross-stage file dependencies.
+    ///
+    /// Returns a map of stage_index -> list of file paths needed from that stage.
+    /// This is used to determine which files need to be saved between stages.
+    ///
+    /// Analogous to Go: `executor.CalculateDependencies(stages, opts, stageNameToIdx)`.
+    pub fn calculate_dependencies(&self) -> Result<HashMap<usize, Vec<String>>> {
+        let mut dep_graph: HashMap<usize, Vec<String>> = HashMap::new();
+
+        // Build stage name to index map
+        let name_to_idx = self.resolve_cross_stage_instructions();
+
+        for stage in &self.stages {
+            for instruction in &stage.instructions {
+                if let Instruction::Copy(copy_instr) = instruction {
+                    if let Some(ref from_stage) = copy_instr.from {
+                        // Resolve the from reference to a stage index
+                        let from_idx = if let Ok(idx) = from_stage.parse::<usize>() {
+                            idx
+                        } else if let Some(&idx) = name_to_idx.get(from_stage) {
+                            idx
+                        } else {
+                            continue;
+                        };
+
+                        if from_idx < self.stages.len() {
+                            // Add source paths as dependencies
+                            let sources: Vec<String> = copy_instr.sources
+                                .iter()
+                                .map(|s| s.clone())
+                                .collect();
+                            dep_graph.entry(from_idx).or_default().extend(sources);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Deduplicate dependency paths
+        for paths in dep_graph.values_mut() {
+            paths.sort();
+            paths.dedup();
+        }
+
+        Ok(dep_graph)
+    }
+
+    /// Resolve cross-stage instruction references.
+    ///
+    /// Builds a map of stage name/alias to stage index.
+    /// Analogous to Go: `executor.ResolveCrossStageInstructions(stages)`.
+    pub fn resolve_cross_stage_instructions(&self) -> HashMap<String, usize> {
+        let mut name_to_idx = HashMap::new();
+
+        for stage in &self.stages {
+            // Map by index string
+            name_to_idx.insert(stage.index.to_string(), stage.index);
+
+            // Map by alias if present
+            if let Some(ref alias) = stage.alias {
+                name_to_idx.insert(alias.clone(), stage.index);
+            }
+        }
+
+        tracing::debug!("Built stage name to index map: {:?}", name_to_idx);
+        name_to_idx
+    }
+}
     use super::*;
     use dockerfile_parser::parse_dockerfile;
 
@@ -465,4 +530,3 @@ COPY --from=builder /app /app
         // test as it would require a more complex Dockerfile parser setup
         // The topological sort implementation is correct and will detect cycles
     }
-}

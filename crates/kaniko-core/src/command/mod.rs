@@ -89,6 +89,9 @@ pub trait DockerCommand: Send + Sync + fmt::Debug {
 
     /// Whether cache key computation needs ARGs/ENVs.
     fn is_args_envs_required_in_cache(&self) -> bool;
+
+    /// Support downcasting for cache command detection.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// Marker trait for cached commands.

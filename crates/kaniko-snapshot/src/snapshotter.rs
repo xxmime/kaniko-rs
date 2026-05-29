@@ -3,7 +3,9 @@
 //! Takes incremental snapshots of the file system and generates OCI layers.
 //! Analogous to Go: `pkg/snapshot.Snapshotter`.
 
+use crate::ignore_list::is_in_ignore_list;
 use crate::layered_map::LayeredMap;
+use crate::volumes;
 use crate::walker::{IgnorePattern, walk_for_snapshot, read_dockerignore, is_ignored};
 use oci_image::layer::Layer;
 use oci_image::whiteout::WhiteoutEntry;
@@ -85,13 +87,25 @@ impl Snapshotter {
     ) -> Result<Option<Layer>> {
         self.layered_map.snapshot();
 
-        if files.is_empty() && !force_build_metadata {
+        // Append volume paths to the files list.
+        // Analogous to Go: `files = append(files, util.Volumes()...)`
+        // Volume contents must be included in snapshots even if no changes were detected,
+        // because Docker volumes persist across commands.
+        let mut all_files: Vec<PathBuf> = files.to_vec();
+        for vol in volumes::volumes() {
+            let vol_path = PathBuf::from(&vol);
+            if vol_path.exists() && !all_files.contains(&vol_path) {
+                all_files.push(vol_path);
+            }
+        }
+
+        if all_files.is_empty() && !force_build_metadata {
             tracing::info!("No files changed in this command, skipping snapshotting.");
             return Ok(None);
         }
 
-        // Resolve paths against .dockerignore patterns
-        let resolved = self.resolve_paths(files);
+        // Resolve paths against .dockerignore patterns and ignore list
+        let resolved = self.resolve_paths(&all_files);
         self.layered_map.add_files(&resolved)?;
 
         // Detect deleted files for whiteout entries
@@ -209,13 +223,20 @@ impl Snapshotter {
         Ok((added, deleted))
     }
 
-    /// Check if a path should be ignored based on .dockerignore patterns.
+    /// Check if a path should be ignored based on .dockerignore patterns and ignore list.
     fn should_ignore(&self, path: &Path) -> bool {
-        if self.dockerignore_patterns.is_empty() {
-            return false;
+        // Check .dockerignore patterns
+        if !self.dockerignore_patterns.is_empty() {
+            let is_dir = path.is_dir();
+            if is_ignored(path, &self.dockerignore_patterns, is_dir) {
+                return true;
+            }
         }
-        let is_dir = path.is_dir();
-        is_ignored(path, &self.dockerignore_patterns, is_dir)
+        // Check the global ignore list (kaniko internal paths)
+        if is_in_ignore_list(path) {
+            return true;
+        }
+        false
     }
 
     /// Resolve paths against the ignore patterns.

@@ -239,16 +239,19 @@ impl MediaType {
         }
     }
 
-    /// Convert a manifest-level media type between Docker and OCI formats.
+    /// Convert a media type between Docker and OCI formats.
     ///
+    /// Supports manifest, config, and layer media types.
     /// Analogous to Go: `executor.convertMediaType()`.
-    pub fn convert_manifest_media_type(media_type: &str) -> Option<String> {
+    /// Reference: <https://github.com/opencontainers/image-spec/blob/main/media-types.md#compatibility-matrix>
+    pub fn convert_media_type(media_type: &str) -> Option<String> {
         match media_type {
             // Docker → OCI
             Self::IMAGE_MANIFEST_V1S2 => Some(Self::OCI_IMAGE_MANIFEST_V1.to_string()),
             Self::IMAGE_MANIFEST_LIST_V2S2 => Some(Self::OCI_IMAGE_INDEX_V1.to_string()),
             Self::LAYER_DOCKER_V2_TAR => Some(Self::LAYER_OCI_V1_TAR.to_string()),
             Self::LAYER_DOCKER_V2_TAR_GZIP => Some(Self::LAYER_OCI_V1_TAR_GZIP.to_string()),
+            Self::LAYER_DOCKER_V2_TAR_ZSTD => Some(Self::LAYER_OCI_V1_TAR_ZSTD.to_string()),
             Self::IMAGE_CONFIG => Some(Self::OCI_IMAGE_CONFIG_V1.to_string()),
 
             // OCI → Docker
@@ -261,6 +264,13 @@ impl MediaType {
 
             _ => None,
         }
+    }
+
+    /// Convert a manifest-level media type between Docker and OCI formats.
+    /// Kept for backward compatibility; prefer `convert_media_type`.
+    #[deprecated(note = "Use convert_media_type instead")]
+    pub fn convert_manifest_media_type(media_type: &str) -> Option<String> {
+        Self::convert_media_type(media_type)
     }
 }
 

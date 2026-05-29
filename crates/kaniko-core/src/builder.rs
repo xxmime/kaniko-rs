@@ -103,6 +103,16 @@ pub struct StageBuilder {
     opts: BuildOptions,
     /// Base image digest for cache key computation.
     base_image_digest: String,
+    /// Cross-stage dependencies: stage_index → list of source paths.
+    cross_stage_deps: std::collections::HashMap<usize, Vec<String>>,
+    /// Cache repo for registry cache.
+    cache_repo: Option<String>,
+    /// Destinations for cache inference.
+    destinations: Vec<String>,
+    /// Whether to use insecure registry.
+    insecure: bool,
+    /// Whether to skip pushing cache layers.
+    no_push_cache: bool,
 }
 
 impl StageBuilder {
@@ -120,6 +130,11 @@ impl StageBuilder {
             root_dir,
             opts: BuildOptions::default(),
             base_image_digest,
+            cross_stage_deps: std::collections::HashMap::new(),
+            cache_repo: None,
+            destinations: Vec::new(),
+            insecure: false,
+            no_push_cache: false,
         }
     }
 
@@ -132,6 +147,36 @@ impl StageBuilder {
     /// Set build arguments.
     pub fn with_args(mut self, args: BuildArgs) -> Self {
         self.args = args;
+        self
+    }
+
+    /// Set cross-stage dependencies.
+    pub fn with_cross_stage_deps(mut self, deps: std::collections::HashMap<usize, Vec<String>>) -> Self {
+        self.cross_stage_deps = deps;
+        self
+    }
+
+    /// Set cache repository.
+    pub fn with_cache_repo(mut self, repo: Option<String>) -> Self {
+        self.cache_repo = repo;
+        self
+    }
+
+    /// Set destinations for cache inference.
+    pub fn with_destinations(mut self, dests: Vec<String>) -> Self {
+        self.destinations = dests;
+        self
+    }
+
+    /// Set insecure registry flag.
+    pub fn with_insecure(mut self, insecure: bool) -> Self {
+        self.insecure = insecure;
+        self
+    }
+
+    /// Set no-push-cache flag.
+    pub fn with_no_push_cache(mut self, no_push: bool) -> Self {
+        self.no_push_cache = no_push;
         self
     }
 
@@ -148,6 +193,36 @@ impl StageBuilder {
         // Analogous to Go: `executor.resolveOnBuild()`.
         self.resolve_onbuild_triggers();
 
+        // Initialize composite cache key with base image digest.
+        // Analogous to Go: `compositeKey = NewCompositeCache(s.baseImageDigest)`.
+        let mut composite_key = crate::command::CompositeCache::new(&self.base_image_digest);
+
+        // Apply optimizations — replace cacheable commands with cached versions.
+        // Analogous to Go: `stageBuilder.optimize()`.
+        if self.opts.cache {
+            if let Err(e) = self.optimize(&mut composite_key) {
+                tracing::warn!("Optimize failed: {}", e);
+            }
+        }
+        // Analogous to Go: `stageBuilder.build()` lines 310-340.
+        let should_unpack = self.should_unpack_fs();
+        if should_unpack {
+            tracing::info!("Unpacking rootfs as a command requires it.");
+            match oci_image::extract::extract_image_to_fs(&self.image, &self.root_dir) {
+                Ok(files) => {
+                    tracing::debug!("Extracted {} files from base image", files.len());
+                }
+                Err(e) => {
+                    return Err(BuildError::Failed(format!(
+                        "failed to get filesystem from image: {}",
+                        e
+                    )));
+                }
+            }
+        } else {
+            tracing::info!("Skipping unpacking as no commands require it.");
+        }
+
         // Initialize snapshotter
         let layered_map = LayeredMap::new();
         let mut snapshotter = Snapshotter::new(layered_map, self.root_dir.clone());
@@ -156,26 +231,6 @@ impl StageBuilder {
         if !self.opts.single_snapshot {
             snapshotter.init()?;
         }
-
-        // Initialize composite cache key
-        let mut composite_key = crate::command::CompositeCache::new(&self.base_image_digest);
-
-        // Initialize local cache if enabled
-        let layout_cache = if self.opts.cache {
-            if let Some(ref cache_dir) = self.opts.cache_dir {
-                let cache = LayoutCache::new(cache_dir);
-                if let Err(e) = cache.init() {
-                    tracing::warn!("Failed to initialize cache: {}", e);
-                    None
-                } else {
-                    Some(cache)
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
 
         let mut init_snapshot_taken = false;
 
@@ -191,8 +246,10 @@ impl StageBuilder {
                     &self.args,
                 );
 
-                // Try cache hit
-                if let Some(ref cache) = layout_cache {
+                // Try cache hit from local layout cache.
+                // Analogous to Go: `s.layerCache.RetrieveLayer(ck)`.
+                if let Some(ref cache_dir) = self.opts.cache_dir {
+                    let cache = LayoutCache::new(cache_dir);
                     let cache_key = composite_key.hash();
                     if cache.exists(&cache_key) {
                         tracing::info!("Cache hit for: {}", cmd_str);
@@ -223,6 +280,25 @@ impl StageBuilder {
             {
                 snapshotter.init()?;
                 init_snapshot_taken = true;
+            }
+
+            // Check if this is a cached command.
+            // Analogous to Go: `isCacheCommand := func() bool { switch command.(type) { case commands.Cached: return true } }()`
+            let is_cache_command = command.command_string().ends_with(" (cached)");
+
+            if is_cache_command {
+                // For cached commands, apply the cached layers directly.
+                // Analogous to Go: `v := command.(commands.Cached); layer := v.Layer(); s.saveLayerToImage(layer, ...)`
+                if let Some(cached) = command.as_any().downcast_ref::<CachedCommand>() {
+                    for layer in cached.layers() {
+                        self.image = oci_image::mutate::append_layer(
+                            self.image.clone(),
+                            layer.clone(),
+                        )?;
+                    }
+                    tracing::debug!("Applied {} cached layers", cached.layers().len());
+                    continue;
+                }
             }
 
             // Execute the command
@@ -278,15 +354,48 @@ impl StageBuilder {
 
             // Append layer to image
             if let Some(layer) = layer {
-                self.image = oci_image::mutate::append_layer(self.image.clone(), layer)?;
+                self.image = oci_image::mutate::append_layer(self.image.clone(), layer.clone())?;
 
-                // Cache the layer if caching is enabled
-                if self.opts.cache {
-                    if let Some(ref cache) = layout_cache {
-                        let cache_key = composite_key.hash();
-                        if let Err(e) = cache.push_layer(&cache_key, &self.image) {
-                            tracing::warn!("Failed to cache layer: {}", e);
+                // Cache the layer if caching is enabled.
+                // Analogous to Go: `pushLayerToCache()` — push layer to cache
+                // in parallel along with new config file.
+                if self.opts.cache && command.should_cache_output() {
+                    let cache_key = composite_key.hash();
+                    let cmd_str_for_cache = cmd_str.clone();
+
+                    // Try local cache first
+                    if let Some(ref cache_dir) = self.opts.cache_dir {
+                        if let Err(e) = kaniko_cache::push::push_layer_to_local_cache(
+                            &Some(cache_dir.clone()),
+                            &cache_key,
+                            &self.image,
+                        ) {
+                            tracing::warn!("Failed to cache layer locally: {}", e);
                         }
+                    }
+
+                    // Try registry cache push (async, non-blocking)
+                    if self.cache_repo.is_some() || !self.destinations.is_empty() {
+                        let cache_repo = self.cache_repo.clone();
+                        let destinations = self.destinations.clone();
+                        let insecure = self.insecure;
+                        let no_push = self.no_push_cache;
+                        let layer_for_cache = layer.clone();
+
+                        tokio::spawn(async move {
+                            if let Err(e) = kaniko_cache::push::push_layer_to_cache(
+                                &cache_repo,
+                                &destinations,
+                                &cache_key,
+                                layer_for_cache,
+                                &cmd_str_for_cache,
+                                &None,
+                                insecure,
+                                no_push,
+                            ).await {
+                                tracing::warn!("Failed to push layer to cache: {}", e);
+                            }
+                        });
                     }
                 }
 
@@ -402,6 +511,133 @@ impl StageBuilder {
         // Skip metadata-only commands (unless it's the last command or forced)
         !is_metadata_cmd
     }
+
+    /// Determine whether the filesystem needs to be unpacked.
+    ///
+    /// Checks if any command requires an unpacked FS, or if there are
+    /// cross-stage dependencies that need the filesystem.
+    ///
+    /// Analogous to Go: `stageBuilder.build()` — shouldUnpack logic.
+    fn should_unpack_fs(&self) -> bool {
+        for cmd in &self.commands {
+            if cmd.requires_unpacked_fs() {
+                tracing::debug!("Command {} requires unpacked FS", cmd.command_string());
+                return true;
+            }
+        }
+        // Also check cross-stage dependencies
+        if !self.cross_stage_deps.is_empty() {
+            return true;
+        }
+        false
+    }
+
+    /// Optimize commands by replacing cacheable ones with cached versions.
+    ///
+    /// Walks through all commands. For those that should be cached,
+    /// computes the composite cache key and checks if a cached layer exists.
+    /// If a cache hit is found, the command is replaced with a cached version.
+    ///
+    /// For metadata-only commands, they are still executed (to track
+    /// state changes for proper cache key computation), but their
+    /// output is discarded.
+    ///
+    /// Analogous to Go: `stageBuilder.optimize()`.
+    fn optimize(
+        &mut self,
+        composite_key: &mut crate::command::CompositeCache,
+    ) -> Result<()> {
+        if !self.opts.cache {
+            return Ok(());
+        }
+
+        let mut stop_cache = false;
+
+        for i in 0..self.commands.len() {
+            let command = &self.commands[i];
+            let cmd_str = command.command_string();
+
+            // Get files used from context for cache key computation
+            let files = command
+                .files_used_from_context(&self.image.config.config, &self.args)
+                .unwrap_or_default();
+
+            // Populate composite key
+            let file_paths: Vec<String> = files.iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
+            composite_key.add_key(&[&cmd_str]);
+            for fp in &file_paths {
+                if let Err(e) = composite_key.add_path(fp) {
+                    tracing::debug!("Failed to add path to composite key: {}", e);
+                }
+            }
+
+            let ck = composite_key.hash();
+            tracing::debug!("Optimize: cache key for command {} = {}", cmd_str, ck);
+
+            // Check if this command should be cached and we haven't
+            // had a cache miss yet
+            if command.should_cache_output() && !stop_cache {
+                // Try local cache hit
+                if let Some(ref cache_dir) = self.opts.cache_dir {
+                    let cache = LayoutCache::new(cache_dir);
+                    if cache.exists(&ck) {
+                        match cache.retrieve_layer(&ck) {
+                            Ok(cached_image) => {
+                                tracing::info!(
+                                    "Using caching version of cmd: {}",
+                                    cmd_str
+                                );
+                                // Replace the command with a CachedCommand wrapper
+                                // that provides the cached layers directly.
+                                let cached_cmd = CachedCommand::new(
+                                    cmd_str.clone(),
+                                    cached_image.layers.clone(),
+                                );
+                                self.commands[i] = Box::new(cached_cmd);
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    "Failed to retrieve layer: {}",
+                                    e
+                                );
+                                tracing::info!(
+                                    "No cached layer found for cmd {}",
+                                    cmd_str
+                                );
+                                tracing::debug!(
+                                    "Key missing was: {}",
+                                    composite_key.key()
+                                );
+                                stop_cache = true;
+                            }
+                        }
+                    } else {
+                        tracing::info!(
+                            "No cached layer found for cmd {}",
+                            cmd_str
+                        );
+                        stop_cache = true;
+                    }
+                }
+            }
+
+            // Execute metadata-only commands to track state
+            // (we need their effect on config for proper cache keys)
+            if command.metadata_only() {
+                // We can't execute async commands here in a sync method,
+                // so just track that we need to execute them later
+                tracing::debug!(
+                    "Optimize: skipping metadata-only command execution: {}",
+                    cmd_str
+                );
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Parse an ONBUILD trigger string into a DockerCommand.
@@ -510,5 +746,78 @@ fn parse_trigger_to_command(trigger: &str) -> Option<Box<dyn DockerCommand>> {
             tracing::warn!("Unknown ONBUILD directive: {}", directive);
             None
         }
+    }
+}
+
+/// A cached command that provides pre-computed layers instead of executing.
+///
+/// When the optimizer finds a cache hit, it replaces the original command
+/// with this wrapper. During the build loop, the cached layers are applied
+/// directly without re-executing the command.
+///
+/// Analogous to Go: `commands.Cached` interface + `CacheCommand()`.
+#[derive(Debug, Clone)]
+struct CachedCommand {
+    /// Original command string for logging.
+    command_string: String,
+    /// Pre-computed layers from cache.
+    layers: Vec<oci_image::layer::Layer>,
+}
+
+impl CachedCommand {
+    fn new(command_string: String, layers: Vec<oci_image::layer::Layer>) -> Self {
+        Self {
+            command_string,
+            layers,
+        }
+    }
+
+    /// Get the cached layers.
+    fn layers(&self) -> &[oci_image::layer::Layer] {
+        &self.layers
+    }
+}
+
+#[async_trait::async_trait]
+impl DockerCommand for CachedCommand {
+    async fn execute(&self, _config: &mut oci_image::config::ContainerConfig, _args: &BuildArgs) -> crate::command::Result<()> {
+        // Cached commands don't execute — layers are applied directly
+        Ok(())
+    }
+
+    fn command_string(&self) -> String {
+        format!("{} (cached)", self.command_string)
+    }
+
+    fn files_to_snapshot(&self) -> Option<Vec<std::path::PathBuf>> {
+        None
+    }
+
+    fn provides_files_to_snapshot(&self) -> bool {
+        false
+    }
+
+    fn metadata_only(&self) -> bool {
+        false
+    }
+
+    fn requires_unpacked_fs(&self) -> bool {
+        false
+    }
+
+    fn should_cache_output(&self) -> bool {
+        true
+    }
+
+    fn should_detect_deleted_files(&self) -> bool {
+        false
+    }
+
+    fn is_args_envs_required_in_cache(&self) -> bool {
+        false
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }

@@ -56,7 +56,7 @@ pub trait BaseCommand: Send + Sync + std::fmt::Debug {
 
 /// Blanket implementation of DockerCommand for any type implementing BaseCommand.
 #[async_trait]
-impl<T: BaseCommand> DockerCommand for T {
+impl<T: BaseCommand + 'static> DockerCommand for T {
     async fn execute(&self, config: &mut ContainerConfig, args: &BuildArgs) -> Result<()> {
         self.execute_impl(config, args).await
     }
@@ -103,5 +103,9 @@ impl<T: BaseCommand> DockerCommand for T {
 
     fn is_args_envs_required_in_cache(&self) -> bool {
         self.is_args_envs_required_in_cache_impl()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }

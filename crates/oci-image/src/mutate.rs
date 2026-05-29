@@ -147,6 +147,79 @@ pub fn append_layer(image: MutableImage, layer: Layer) -> Result<MutableImage> {
     append_layers(image, vec![layer])
 }
 
+/// Append a single layer with custom history entry.
+///
+/// Analogous to Go: `mutate.Append()` with `mutate.Addendum{History: ...}`.
+pub fn append_layer_with_history(
+    image: MutableImage,
+    layer: Layer,
+    history: HistoryEntry,
+) -> Result<MutableImage> {
+    let mut manifest = image.manifest;
+    let mut config = image.config;
+    let mut existing_layers = image.layers;
+
+    // Update manifest.layers
+    manifest.layers.push(layer.to_descriptor());
+
+    // Update config.rootfs.diff_ids
+    config.rootfs.diff_ids.push(layer.diff_id().to_string());
+
+    // Update config.history with the provided entry
+    config.history.push(history);
+
+    existing_layers.push(layer);
+
+    // Recalculate config descriptor
+    let config_bytes = serde_json::to_vec(&config)?;
+    let config_digest = Sha256Digest::from_bytes(&config_bytes);
+    let config_size = config_bytes.len() as u64;
+
+    manifest.config = Descriptor {
+        media_type: MediaType::OCI_IMAGE_CONFIG_V1.to_string(),
+        digest: config_digest,
+        size: config_size,
+        annotations: Default::default(),
+        platform: None,
+    };
+
+    Ok(MutableImage {
+        manifest,
+        config,
+        config_bytes,
+        layers: existing_layers,
+    })
+}
+
+/// Set the created timestamp on the image.
+///
+/// Analogous to Go: `mutate.CreatedAt()`.
+pub fn set_created_at(image: MutableImage, timestamp: String) -> Result<MutableImage> {
+    let mut config = image.config;
+    config.created = Some(timestamp);
+
+    // Recalculate config descriptor
+    let config_bytes = serde_json::to_vec(&config)?;
+    let config_digest = Sha256Digest::from_bytes(&config_bytes);
+    let config_size = config_bytes.len() as u64;
+
+    let mut manifest = image.manifest;
+    manifest.config = Descriptor {
+        media_type: MediaType::OCI_IMAGE_CONFIG_V1.to_string(),
+        digest: config_digest,
+        size: config_size,
+        annotations: Default::default(),
+        platform: None,
+    };
+
+    Ok(MutableImage {
+        manifest,
+        config,
+        config_bytes,
+        layers: image.layers,
+    })
+}
+
 /// Update the image configuration.
 ///
 /// The closure receives a mutable reference to the ContainerConfig
