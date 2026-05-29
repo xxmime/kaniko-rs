@@ -97,82 +97,8 @@ pub trait CachedCommand: DockerCommand {
 }
 
 /// Composite cache key for layer caching.
-#[derive(Debug, Clone)]
-pub struct CompositeCache {
-    base_image_digest: String,
-    command_hash: String,
-    files_hash: String,
-    args_hash: String,
-}
-
-impl CompositeCache {
-    /// Create a new composite cache key.
-    pub fn new(base_image_digest: &str) -> Self {
-        Self {
-            base_image_digest: base_image_digest.to_string(),
-            command_hash: String::new(),
-            files_hash: String::new(),
-            args_hash: String::new(),
-        }
-    }
-
-    /// Update the cache key with new command information.
-    pub fn update(
-        self,
-        command_str: &str,
-        files: Vec<PathBuf>,
-        args: &BuildArgs,
-    ) -> Self {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        // Hash the command string
-        let mut command_hasher = DefaultHasher::new();
-        command_str.hash(&mut command_hasher);
-        let command_hash = command_hasher.finish().to_string();
-
-        // Hash the files
-        let mut files_hasher = DefaultHasher::new();
-        for file in files {
-            file.hash(&mut files_hasher);
-        }
-        let files_hash = files_hasher.finish().to_string();
-
-        // Hash the build args
-        let mut args_hasher = DefaultHasher::new();
-        // Hash the build_args HashMap
-        for (key, value) in &args.build_args {
-            key.hash(&mut args_hasher);
-            value.hash(&mut args_hasher);
-        }
-        // Hash the env Vec
-        for (key, value) in &args.env {
-            key.hash(&mut args_hasher);
-            value.hash(&mut args_hasher);
-        }
-        let args_hash = args_hasher.finish().to_string();
-
-        Self {
-            base_image_digest: self.base_image_digest,
-            command_hash,
-            files_hash,
-            args_hash,
-        }
-    }
-
-    /// Generate the final cache key hash.
-    pub fn hash(&self) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        self.base_image_digest.hash(&mut hasher);
-        self.command_hash.hash(&mut hasher);
-        self.files_hash.hash(&mut hasher);
-        self.args_hash.hash(&mut hasher);
-        hasher.finish().to_string()
-    }
-}
+/// Re-exported from the composite_key module for backward compatibility.
+pub use crate::composite_key::CompositeCache;
 
 // Sub-modules with individual command implementations.
 mod env;

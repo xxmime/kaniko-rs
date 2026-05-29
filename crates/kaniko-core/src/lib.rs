@@ -5,10 +5,12 @@
 
 pub mod builder;
 pub mod command;
+pub mod composite_key;
 pub mod config;
 pub mod multistage_builder;
 
 pub use builder::{BuildOptions, BuildError, Result};
+pub use composite_key::CompositeCache;
 
 /// Version of the kaniko-rs core library
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

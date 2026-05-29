@@ -219,6 +219,10 @@ async fn do_build(
         // Execute commands in this stage
         let mut container_config = image.config.config.clone();
 
+        // Track ENTRYPOINT and CMD for reviewConfig
+        let mut has_entrypoint = false;
+        let mut has_cmd = false;
+
         for instruction in &stage.instructions {
             execute_instruction(
                 instruction,
@@ -227,11 +231,29 @@ async fn do_build(
                 context_path,
                 cli,
             ).await?;
+
+            // Track ENTRYPOINT/CMD presence for reviewConfig
+            match instruction {
+                dockerfile_parser::Instruction::Entrypoint(_) => has_entrypoint = true,
+                dockerfile_parser::Instruction::Cmd(_) => has_cmd = true,
+                _ => {}
+            }
+        }
+
+        // Review config: if ENTRYPOINT was set but CMD was not, clear CMD.
+        // Analogous to Go: `reviewConfig(stage, &config)`.
+        if has_entrypoint && !has_cmd {
+            tracing::debug!("Clearing Cmd because Entrypoint was set without a new Cmd");
+            container_config.cmd = None;
         }
 
         // Update the image config with the modified container config
         image.config.config = container_config;
         image.config_bytes = serde_json::to_vec(&image.config)?;
+
+        // Set platform (os/architecture) from --platform or auto-detect.
+        // Analogous to Go: `configFile.OS = runtime.GOOS; configFile.Architecture = runtime.GOARCH`.
+        set_platform(&mut image, cli.platform.first().map(|s| s.as_str()));
 
         // Apply reproducible mode — strip timestamps
         if cli.reproducible {
@@ -744,6 +766,25 @@ fn build_registry_options(cli: &Cli) -> RegistryOptions {
     }
 
     opts
+}
+
+/// Set the platform (os/architecture) on the image config.
+/// Analogous to Go: `configFile.OS = runtime.GOOS; configFile.Architecture = runtime.GOARCH`
+/// or `opts.CustomPlatform` parsing.
+fn set_platform(image: &mut MutableImage, platform: Option<&str>) {
+    let (os, arch) = if let Some(p) = platform {
+        // Parse "os/arch" or "os/arch/variant" format
+        let parts: Vec<&str> = p.split('/').collect();
+        let os = parts.first().unwrap_or(&"linux").to_string();
+        let arch = parts.get(1).unwrap_or(&"amd64").to_string();
+        (os, arch)
+    } else {
+        // Auto-detect from the current system
+        (std::env::consts::OS.to_string(), std::env::consts::ARCH.to_string())
+    };
+    image.config.os = os.clone();
+    image.config.architecture = arch.clone();
+    tracing::debug!("Set image platform: {}/{}", os, arch);
 }
 
 /// Write image as a Docker tar archive.

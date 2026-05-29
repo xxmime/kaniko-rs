@@ -6,6 +6,7 @@ pub mod ignore_list;
 pub mod hasher;
 pub mod layered_map;
 pub mod snapshotter;
+pub mod volumes;
 pub mod walker;
 
 pub use ignore_list::{
@@ -16,4 +17,5 @@ pub use ignore_list::{
 pub use hasher::{SnapshotMode, HasherError};
 pub use layered_map::LayeredMap;
 pub use snapshotter::Snapshotter;
+pub use volumes::{add_volume, add_volumes, volumes, is_volume, clear_volumes, add_volume_to_ignore_list};
 pub use walker::{IgnorePattern, parse_dockerignore, read_dockerignore, walk_with_ignore, walk_for_snapshot};
