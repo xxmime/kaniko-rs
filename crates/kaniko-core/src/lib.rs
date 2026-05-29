@@ -3,6 +3,7 @@
 //! This crate provides the core functionality for building OCI images
 //! from Dockerfiles in a rootless environment.
 
+pub mod buildcontext;
 pub mod builder;
 pub mod command;
 pub mod composite_key;
@@ -18,3 +19,4 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Re-export commonly used types
 pub use builder::StageBuilder;
 pub use multistage_builder::MultiStageBuilder;
+pub use buildcontext::{BuildContext, ContextScheme, ContextError, resolve_build_context};

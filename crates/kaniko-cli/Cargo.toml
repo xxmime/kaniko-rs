@@ -8,6 +8,7 @@ license.workspace = true
 kaniko-core = { workspace = true }
 kaniko-creds = { workspace = true }
 kaniko-snapshot = { workspace = true }
+kaniko-util = { path = "../kaniko-util" }
 oci-image = { workspace = true }
 oci-registry = { workspace = true }
 dockerfile-parser = { workspace = true }

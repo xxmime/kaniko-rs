@@ -1,6 +1,8 @@
 //! File system snapshotter.
 //!
 //! Takes incremental snapshots of the file system and generates OCI layers.
+//! Supports a configurable snapshot timeout via the `SNAPSHOT_TIMEOUT_DURATION`
+//! environment variable (default: 90 minutes).
 //! Analogous to Go: `pkg/snapshot.Snapshotter`.
 
 use crate::ignore_list::is_in_ignore_list;
@@ -10,7 +12,103 @@ use crate::walker::{IgnorePattern, walk_for_snapshot, read_dockerignore, is_igno
 use oci_image::layer::Layer;
 use oci_image::whiteout::WhiteoutEntry;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 use thiserror::Error;
+
+/// Default snapshot timeout: 90 minutes.
+/// Analogous to Go: `fs_util.SNAPSHOT_TIMEOUT_DURATION = "90m"`.
+pub const DEFAULT_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(90 * 60);
+
+/// Global snapshot timeout, read from the `SNAPSHOT_TIMEOUT_DURATION` env var.
+/// Supported formats: "90m", "1h30m", "5400s", or a plain number of seconds.
+static SNAPSHOT_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+    match std::env::var("SNAPSHOT_TIMEOUT_DURATION") {
+        Ok(val) => parse_snapshot_timeout(&val),
+        Err(_) => DEFAULT_SNAPSHOT_TIMEOUT,
+    }
+});
+
+/// Parse the snapshot timeout string.
+/// Supports: "90m", "1h", "5400s", "5400" (bare seconds).
+pub fn parse_snapshot_timeout(s: &str) -> Duration {
+    let s = s.trim();
+    if s.is_empty() {
+        return DEFAULT_SNAPSHOT_TIMEOUT;
+    }
+
+    // Try to parse as a simple number of seconds
+    if let Ok(secs) = s.parse::<u64>() {
+        return Duration::from_secs(secs);
+    }
+
+    // Parse h/m/s suffixes
+    let mut total_secs: u64 = 0;
+    let mut num_buf = String::new();
+    for ch in s.chars() {
+        match ch {
+            'h' => {
+                if let Ok(n) = num_buf.parse::<u64>() {
+                    total_secs += n * 3600;
+                }
+                num_buf.clear();
+            }
+            'm' => {
+                if let Ok(n) = num_buf.parse::<u64>() {
+                    total_secs += n * 60;
+                }
+                num_buf.clear();
+            }
+            's' => {
+                if let Ok(n) = num_buf.parse::<u64>() {
+                    total_secs += n;
+                }
+                num_buf.clear();
+            }
+            '0'..='9' => {
+                num_buf.push(ch);
+            }
+            _ => {
+                // Skip unknown characters
+            }
+        }
+    }
+    // Handle trailing number without suffix as seconds
+    if let Ok(n) = num_buf.parse::<u64>() {
+        total_secs += n;
+    }
+
+    if total_secs > 0 {
+        Duration::from_secs(total_secs)
+    } else {
+        DEFAULT_SNAPSHOT_TIMEOUT
+    }
+}
+
+/// Check if a snapshot operation has exceeded the timeout.
+///
+/// Returns `Ok(())` if within the timeout, or an error if exceeded.
+/// Analogous to Go: `fs_util.CheckSnapshotTimeout()`.
+pub fn check_snapshot_timeout(start: Instant) -> std::result::Result<(), SnapshotError> {
+    let elapsed = start.elapsed();
+    if elapsed > *SNAPSHOT_TIMEOUT {
+        Err(SnapshotError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "Snapshot operation exceeded timeout of {:.0}s (elapsed: {:.0}s)",
+                SNAPSHOT_TIMEOUT.as_secs_f64(),
+                elapsed.as_secs_f64()
+            ),
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Get the configured snapshot timeout duration.
+pub fn snapshot_timeout() -> Duration {
+    *SNAPSHOT_TIMEOUT
+}
 
 /// Errors for snapshotter operations.
 #[derive(Debug, Error)]
@@ -124,8 +222,14 @@ impl Snapshotter {
     /// Take a snapshot of the entire file system.
     ///
     /// Used when we can't determine which files changed (e.g., after RUN).
+    /// Includes timeout checking to prevent indefinitely long snapshots.
     pub fn take_snapshot_fs(&mut self) -> Result<Layer> {
+        let start = Instant::now();
+
         let (added, deleted) = self.scan_full_filesystem_with_diff()?;
+
+        // Check timeout after the potentially long filesystem scan
+        check_snapshot_timeout(start)?;
 
         let whiteouts: Vec<WhiteoutEntry> = deleted
             .iter()

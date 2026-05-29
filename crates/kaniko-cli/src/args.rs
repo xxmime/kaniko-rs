@@ -225,6 +225,10 @@ pub struct Cli {
     #[arg(long)]
     pub sandbox: bool,
 
+    /// Skip unpacking the base image filesystem when the first stage is already unpacked.
+    #[arg(long)]
+    pub initial_fs_unpacked: bool,
+
     // ===== Logging options =====
 
     /// Log level (trace, debug, info, warn, error).

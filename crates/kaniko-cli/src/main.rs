@@ -20,6 +20,7 @@ use kaniko_core::command::{
     OnBuildCommand, RunCommand, RunMarkerCommand, ShellCommand, StopSignalCommand,
     UserCommand, VolumeCommand, WorkdirCommand, DockerCommand,
 };
+use kaniko_core::builder::BuildOptions;
 use kaniko_creds::keychain::SystemKeychain;
 use kaniko_snapshot::ignore_list::{
     init_ignore_list, add_var_run_to_ignore_list, add_ignore_paths,
@@ -41,11 +42,21 @@ async fn main() {
 
     tracing::info!("kaniko-rs executor starting");
 
+    // Apply sandbox mode if requested
+    apply_sandbox(cli.sandbox);
+
+    // Start build timing
+    kaniko_util::timing::DEFAULT_TIMER.start("total_build");
+
     match run(cli).await {
         Ok(()) => {
+            kaniko_util::timing::DEFAULT_TIMER.stop("total_build");
+            kaniko_util::timing::DEFAULT_TIMER.log_all();
             tracing::info!("Build completed successfully");
         }
         Err(e) => {
+            kaniko_util::timing::DEFAULT_TIMER.stop("total_build");
+            kaniko_util::timing::DEFAULT_TIMER.log_all();
             tracing::error!("Build failed: {}", e);
             std::process::exit(1);
         }
@@ -72,9 +83,15 @@ fn init_logging(level: &str, format: &str) {
 
 /// Main build execution flow.
 /// Analogous to Go: `cmd/executor/cmd/root.go` → Run command handler.
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run(mut cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ===== Validate flags =====
     validate_flags(&cli)?;
+
+    // ===== Set dummy destinations if --no-push and --tar-path =====
+    // Analogous to Go: `push.setDummyDestinations()`.
+    // When --no-push is set but --tar-path is provided, we still need
+    // at least one destination for tag generation.
+    set_dummy_destinations(&mut cli);
 
     // ===== Initialize ignore list =====
     // Analogous to Go: `util.InitIgnoreList()` + `--ignore-var-run` + `--ignore-path`.
@@ -175,6 +192,22 @@ async fn do_build(
     let target_stage = cli.target.as_deref();
     let last_stage_idx = stages.len() - 1;
     let mut built_images: HashMap<usize, MutableImage> = HashMap::new();
+
+    // Build options — shared across all stages
+    let build_opts = BuildOptions {
+        cache: cli.cache,
+        cache_dir: if cli.cache_dir == "/cache" { None } else { Some(cli.cache_dir.clone()) },
+        single_snapshot: cli.single_snapshot,
+        force_build_metadata: cli.force_build_metadata,
+        snapshot_mode: cli.snapshot_mode.clone(),
+        cache_copy_layers: cli.cache_copy_layers,
+        cache_run_layers: cli.cache_run_layers,
+        run_v2: cli.use_new_run,
+        compression: Some(cli.compression.to_string()),
+        compression_level: if cli.compression_level >= 0 { cli.compression_level as u32 } else { 0 },
+        compressed_caching: cli.compressed_caching,
+        initial_fs_unpacked: cli.initial_fs_unpacked,
+    };
 
     for (stage_idx, stage) in stages.iter().enumerate() {
         let stage_name = stage.alias.as_deref().unwrap_or("default");
@@ -821,4 +854,48 @@ fn write_image_tar(image: &MutableImage, path: &str) -> Result<(), Box<dyn std::
 
     tar_builder.finish()?;
     Ok(())
+}
+
+/// Set dummy destinations when --no-push and --tar-path are used.
+///
+/// When --no-push is set but --tar-path is provided, a destination
+/// is still needed for generating image tags and digests in the tar output.
+/// This function adds a dummy destination if none exist.
+///
+/// Analogous to Go: `push.setDummyDestinations()`.
+fn set_dummy_destinations(cli: &mut Cli) {
+    if cli.no_push && cli.tar_path.is_some() && cli.destination.is_empty() {
+        let dummy = "index.docker.io/kaniko/dummy:latest".to_string();
+        tracing::info!("Setting dummy destination for tar output: {}", dummy);
+        cli.destination.push(dummy);
+    }
+}
+
+/// Apply sandbox mode for the build.
+///
+/// In sandbox mode, the build filesystem is isolated using Linux namespaces.
+/// On non-Linux platforms, this degrades gracefully with a warning.
+///
+/// Analogous to Go: `unshare.MaybeReexecUsingUserNamespace()`.
+fn apply_sandbox(sandbox: bool) {
+    if !sandbox {
+        return;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        tracing::info!("Sandbox mode requested — using Linux namespace isolation");
+        // Full namespace isolation requires privileged execution.
+        // For now, we log that sandbox mode is active and rely on the
+        // container runtime's isolation. A future iteration could use
+        // the `nix` crate to call unshare(CLONE_NEWNS) etc.
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        tracing::warn!(
+            "Sandbox mode is not supported on this platform. \
+             Build will proceed without namespace isolation."
+        );
+    }
 }

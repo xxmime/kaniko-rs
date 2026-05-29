@@ -9,6 +9,45 @@ use dockerfile_parser::{Stage, Instruction};
 use oci_image::mutate::MutableImage;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+#[cfg(target_family = "unix")]
+use std::os::unix::fs::PermissionsExt;
+
+/// Deduplicate a list of file paths, removing paths that are
+/// sub-paths of other entries.
+///
+/// For example, given ["/app", "/app/bin", "/etc"],
+/// this returns ["/app", "/etc"] because "/app/bin" is
+/// already covered by "/app".
+///
+/// Analogous to Go: `executor.deduplicatePaths()` (build.go:862-900).
+pub fn deduplicate_paths(paths: &mut Vec<String>) {
+    if paths.is_empty() {
+        return;
+    }
+
+    // Sort so that shorter (parent) paths come first
+    paths.sort();
+    paths.dedup();
+
+    let mut result: Vec<String> = Vec::new();
+    for path in paths.drain(..) {
+        // Check if this path is already covered by an existing entry
+        let dominated = result.iter().any(|existing| {
+            path.starts_with(existing.as_str())
+                && (path.len() == existing.len() || path.as_bytes().get(existing.len()) == Some(&b'/'))
+        });
+        if !dominated {
+            // Remove any existing entries that are sub-paths of this one
+            result.retain(|existing| {
+                !existing.starts_with(path.as_str())
+                    || (existing.len() > path.len() && existing.as_bytes().get(path.len()) != Some(&b'/'))
+            });
+            result.push(path);
+        }
+    }
+
+    *paths = result;
+}
 
 /// Multi-stage builder — orchestrates building all Dockerfile stages.
 ///
@@ -370,6 +409,121 @@ impl MultiStageBuilder {
 
         tracing::debug!("Built stage name to index map: {:?}", name_to_idx);
         name_to_idx
+    }
+
+    /// Calculate the list of files to save from a built stage.
+    ///
+    /// Traverses all stages that depend on `stage_index` via COPY --from,
+    /// collecting the source paths they reference. These files need to be
+    /// preserved when the stage is complete so that later stages can copy
+    /// from them.
+    ///
+    /// Analogous to Go: `executor.filesToSave()` (build.go:830-862).
+    pub fn files_to_save(&self, stage_index: usize) -> Vec<String> {
+        let mut files = Vec::new();
+
+        for stage in &self.stages {
+            for instruction in &stage.instructions {
+                if let Instruction::Copy(copy_instr) = instruction {
+                    if let Some(ref from_stage) = copy_instr.from {
+                        let from_idx = if let Ok(idx) = from_stage.parse::<usize>() {
+                            idx
+                        } else if let Some(s) = self.stages.iter().find(|s| s.alias.as_deref() == Some(from_stage)) {
+                            s.index
+                        } else {
+                            continue;
+                        };
+
+                        if from_idx == stage_index {
+                            files.extend(copy_instr.sources.iter().cloned());
+                        }
+                    }
+                }
+            }
+        }
+
+        deduplicate_paths(&mut files);
+        files
+    }
+
+    /// Save a stage's filesystem as a tarball.
+    ///
+    /// This persists a completed stage to disk so that later stages
+    /// can reference it via COPY --from.
+    ///
+    /// Analogous to Go: `executor.saveStageAsTarball()` (build.go:798-828).
+    pub fn save_stage_as_tarball(
+        &self,
+        stage_index: usize,
+        tar_path: &std::path::Path,
+    ) -> std::io::Result<()> {
+        // Ensure the output directory exists
+        if let Some(parent) = tar_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let stage_dir = self.root_dir.join(format!("stage-{}", stage_index));
+        if !stage_dir.exists() {
+            tracing::warn!("Stage directory {} does not exist, skipping tarball", stage_dir.display());
+            return Ok(());
+        }
+
+        let file = std::fs::File::create(tar_path)?;
+        let mut builder = tar::Builder::new(file);
+
+        // Walk the stage directory and add all files
+        for entry in walkdir::WalkDir::new(&stage_dir) {
+            let entry = entry?;
+            let path = entry.path();
+
+            if path == stage_dir {
+                continue;
+            }
+
+            let rel_path = path.strip_prefix(&stage_dir).unwrap_or(path);
+            if rel_path.as_os_str().is_empty() {
+                continue;
+            }
+
+            let metadata = std::fs::symlink_metadata(path)?;
+            if metadata.is_file() {
+                let mut header = tar::Header::new_gnu();
+                header.set_path(rel_path)?;
+                header.set_size(metadata.len());
+                header.set_mode(metadata.permissions().mode());
+                let mtime = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                header.set_mtime(mtime);
+                header.set_cksum();
+                let mut f = std::fs::File::open(path)?;
+                builder.append(&header, &mut f)?;
+            } else if metadata.is_dir() {
+                let mut header = tar::Header::new_gnu();
+                header.set_path(rel_path)?;
+                header.set_size(0);
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_mode(metadata.permissions().mode());
+                header.set_cksum();
+                builder.append(&header, std::io::empty())?;
+            } else if metadata.is_symlink() {
+                let target = std::fs::read_link(path)?;
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_path(rel_path)?;
+                header.set_link_name(&target)?;
+                header.set_size(0);
+                header.set_cksum();
+                builder.append(&header, std::io::empty())?;
+            }
+        }
+
+        builder.finish()?;
+        tracing::info!("Saved stage {} as tarball: {}", stage_index, tar_path.display());
+        Ok(())
     }
 }
     use super::*;

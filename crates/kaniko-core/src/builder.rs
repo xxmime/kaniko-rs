@@ -7,7 +7,9 @@ use crate::command::{BuildArgs, DockerCommand};
 use kaniko_cache::layout::LayoutCache;
 use kaniko_snapshot::snapshotter::Snapshotter;
 use kaniko_snapshot::layered_map::LayeredMap;
+use oci_image::manifest::MediaType;
 use oci_image::mutate::MutableImage;
+use oci_image::layer::Layer;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -60,6 +62,10 @@ pub struct BuildOptions {
     pub compression_level: u32,
     /// Whether to use compressed caching.
     pub compressed_caching: bool,
+    /// Whether the initial filesystem is already unpacked.
+    /// When true, the first stage skips base image extraction.
+    /// Analogous to Go: `opts.InitialFSUnpacked`.
+    pub initial_fs_unpacked: bool,
 }
 
 impl Default for BuildOptions {
@@ -76,6 +82,7 @@ impl Default for BuildOptions {
             compression: None,
             compression_level: 0,
             compressed_caching: false,
+            initial_fs_unpacked: false,
         }
     }
 }
@@ -113,6 +120,8 @@ pub struct StageBuilder {
     insecure: bool,
     /// Whether to skip pushing cache layers.
     no_push_cache: bool,
+    /// Stage index (0-based) within the multi-stage build.
+    stage_index: usize,
 }
 
 impl StageBuilder {
@@ -135,6 +144,7 @@ impl StageBuilder {
             destinations: Vec::new(),
             insecure: false,
             no_push_cache: false,
+            stage_index: 0,
         }
     }
 
@@ -177,6 +187,12 @@ impl StageBuilder {
     /// Set no-push-cache flag.
     pub fn with_no_push_cache(mut self, no_push: bool) -> Self {
         self.no_push_cache = no_push;
+        self
+    }
+
+    /// Set stage index.
+    pub fn with_stage_index(mut self, index: usize) -> Self {
+        self.stage_index = index;
         self
     }
 
@@ -517,8 +533,18 @@ impl StageBuilder {
     /// Checks if any command requires an unpacked FS, or if there are
     /// cross-stage dependencies that need the filesystem.
     ///
+    /// When `initial_fs_unpacked` is true and this is stage 0,
+    /// the FS is already on disk so we skip extraction.
+    ///
     /// Analogous to Go: `stageBuilder.build()` — shouldUnpack logic.
     fn should_unpack_fs(&self) -> bool {
+        // If the initial FS is already unpacked and this is the first stage,
+        // skip extraction. Analogous to Go: `s.stage.Index == 0 && s.opts.InitialFSUnpacked`.
+        if self.stage_index == 0 && self.opts.initial_fs_unpacked {
+            tracing::info!("Initial filesystem already unpacked, skipping extraction");
+            return false;
+        }
+
         for cmd in &self.commands {
             if cmd.requires_unpacked_fs() {
                 tracing::debug!("Command {} requires unpacked FS", cmd.command_string());
@@ -820,4 +846,67 @@ impl DockerCommand for CachedCommand {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+}
+
+/// Save a layer to the image, converting its media type if needed.
+///
+/// When the image manifest uses a different vendor prefix (OCI vs Docker)
+/// than the layer, the layer's media type must be converted to match.
+/// This ensures consistency within the manifest.
+///
+/// Analogous to Go: `stageBuilder.saveLayerToImage()` + `convertLayerMediaType()`.
+pub fn save_layer_to_image(
+    image: MutableImage,
+    layer: Layer,
+    use_zstd: bool,
+) -> Result<MutableImage> {
+    // Determine the target vendor from the image manifest's media type
+    let manifest_media_type = image.manifest.media_type.as_deref().unwrap_or("");
+    let image_vendor = MediaType::extract_vendor_prefix(manifest_media_type);
+
+    // Convert the layer's media type to match the image vendor
+    let converted_layer = convert_layer_media_type(layer, image_vendor, use_zstd)?;
+
+    oci_image::mutate::append_layer(image, converted_layer)
+        .map_err(BuildError::Mutate)
+}
+
+/// Convert a layer's media type to match the image's vendor prefix.
+///
+/// When building an OCI image from a Docker base image (or vice versa),
+/// the layers from the base image may use a different media type vendor.
+/// This function converts the layer's media type to match the target vendor.
+///
+/// Analogous to Go: `executor.convertLayerMediaType()` (build.go:576-608).
+pub fn convert_layer_media_type(
+    layer: Layer,
+    target_vendor: &str,
+    use_zstd: bool,
+) -> Result<Layer> {
+    let current_media_type = layer.media_type().to_string();
+    let current_vendor = MediaType::extract_vendor_prefix(&current_media_type);
+
+    if current_vendor == target_vendor {
+        // Same vendor — no conversion needed
+        return Ok(layer);
+    }
+
+    // Determine the target media type
+    let target_media_type = MediaType::convert_layer_media_type(
+        &current_media_type,
+        target_vendor,
+        use_zstd,
+    ).ok_or_else(|| BuildError::Failed(format!(
+        "cannot convert layer media type from '{}' to vendor '{}'",
+        current_media_type, target_vendor
+    )))?;
+
+    tracing::debug!(
+        "Converting layer media type: {} → {}",
+        current_media_type,
+        target_media_type
+    );
+
+    layer.with_media_type(&target_media_type)
+        .map_err(|e| BuildError::Failed(format!("failed to convert layer media type: {}", e)))
 }
