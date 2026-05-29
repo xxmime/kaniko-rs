@@ -12,6 +12,7 @@
 
 pub mod config;
 pub mod digest;
+pub mod extract;
 pub mod index;
 pub mod layer;
 pub mod layout;
@@ -21,6 +22,7 @@ pub mod whiteout;
 
 pub use config::{ContainerConfig, HistoryEntry, ImageConfig, RootFs};
 pub use digest::Sha256Digest;
+pub use extract::{extract_image_to_fs, extract_layer_to_fs, ExtractError};
 pub use index::{ImageIndex, IndexManifest};
 pub use layer::{Layer, LayerReader};
 pub use layout::{write_layout, read_layout, LayoutError};
