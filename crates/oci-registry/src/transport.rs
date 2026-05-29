@@ -121,6 +121,140 @@ pub fn build_client(skip_tls_verify: bool) -> reqwest::Client {
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// Build a reqwest client with full registry options support.
+///
+/// This function considers:
+/// - Per-registry TLS skip (from `RegistryOptions`)
+/// - Custom CA certificates (from `RegistryOptions`)
+/// - Custom User-Agent header
+/// - `skip_tls_verify` as a fallback
+pub fn build_client_with_options(
+    skip_tls_verify: bool,
+    registry_options: Option<&RegistryOptions>,
+    registry: &str,
+    user_agent: &str,
+) -> reqwest::Client {
+    let should_skip_tls = skip_tls_verify
+        || registry_options
+            .map_or(false, |ro| ro.should_skip_tls_verify(registry));
+
+    let mut builder = reqwest::ClientBuilder::new()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .user_agent(user_agent);
+
+    if should_skip_tls {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+
+    // Load custom CA certificate if configured for this registry.
+    if let Some(ro) = registry_options {
+        if let Some(cert_path) = ro.registry_certificates.get(registry) {
+            match load_ca_certificate(cert_path) {
+                Ok(cert) => {
+                    builder = builder.add_root_certificate(cert);
+                    tracing::info!(
+                        "Loaded custom CA certificate for {} from {:?}",
+                        registry,
+                        cert_path
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load CA certificate for {} from {:?}: {}",
+                        registry,
+                        cert_path,
+                        e
+                    );
+                }
+            }
+        }
+
+        // Load client certificate (mTLS) if configured.
+        if let Some(client_cert_spec) = ro.registry_client_certificates.get(registry) {
+            match load_client_identity(client_cert_spec) {
+                Ok(identity) => {
+                    builder = builder.identity(identity);
+                    tracing::info!(
+                        "Loaded client certificate for {} from {}",
+                        registry,
+                        client_cert_spec
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load client certificate for {}: {}",
+                        registry,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    builder.build().unwrap_or_else(|e| {
+        tracing::warn!("Failed to build HTTP client with options: {}, using default", e);
+        reqwest::Client::new()
+    })
+}
+
+/// Load a CA certificate from a PEM file.
+fn load_ca_certificate(path: &std::path::Path) -> Result<reqwest::Certificate, TransportError> {
+    let pem_data = std::fs::read(path).map_err(|e| {
+        TransportError::Certificate(format!(
+            "failed to read CA certificate from {:?}: {}",
+            path, e
+        ))
+    })?;
+    reqwest::Certificate::from_pem(&pem_data).map_err(|e| {
+        TransportError::Certificate(format!(
+            "failed to parse CA certificate from {:?}: {}",
+            path, e
+        ))
+    })
+}
+
+/// Load a client identity (certificate + key) for mTLS.
+///
+/// The `spec` format is "cert_path,key_path" (comma-separated).
+fn load_client_identity(spec: &str) -> Result<reqwest::Identity, TransportError> {
+    let parts: Vec<&str> = spec.splitn(2, ',').collect();
+    if parts.len() != 2 {
+        return Err(TransportError::Config(format!(
+            "client certificate spec must be 'cert_path,key_path', got: {}",
+            spec
+        )));
+    }
+
+    let cert_path = parts[0];
+    let key_path = parts[1];
+
+    let cert_pem = std::fs::read(cert_path).map_err(|e| {
+        TransportError::Certificate(format!(
+            "failed to read client certificate from {}: {}",
+            cert_path, e
+        ))
+    })?;
+    let key_pem = std::fs::read(key_path).map_err(|e| {
+        TransportError::Certificate(format!(
+            "failed to read client key from {}: {}",
+            key_path, e
+        ))
+    })?;
+
+    // Combine cert and key into a single PKCS#12 identity.
+    // reqwest requires PEM format with both cert and key.
+    let mut identity_pem = cert_pem;
+    identity_pem.extend_from_slice(&key_pem);
+
+    reqwest::Identity::from_pem(&identity_pem).map_err(|e| {
+        TransportError::Certificate(format!(
+            "failed to create client identity from {} + {}: {}",
+            cert_path, key_path, e
+        ))
+    })
+}
+
 /// Execute an HTTP request with retry logic.
 ///
 /// Retries on connection errors and 5xx server errors.
@@ -241,5 +375,88 @@ mod tests {
     fn test_build_client_skip_tls() {
         let client = build_client(true);
         assert!(client.get("https://example.com").try_clone().is_some());
+    }
+
+    #[test]
+    fn test_build_client_with_options_basic() {
+        let client = build_client_with_options(false, None, "gcr.io", "kaniko/0.1.0");
+        assert!(client.get("https://example.com").try_clone().is_some());
+    }
+
+    #[test]
+    fn test_build_client_with_options_skip_tls() {
+        let client = build_client_with_options(true, None, "gcr.io", "kaniko/0.1.0");
+        assert!(client.get("https://example.com").try_clone().is_some());
+    }
+
+    #[test]
+    fn test_build_client_with_options_registry_tls() {
+        let mut ro = RegistryOptions::new();
+        ro.skip_tls_verify_registries.push("insecure.registry".to_string());
+        let client = build_client_with_options(false, Some(&ro), "insecure.registry", "kaniko/0.1.0");
+        assert!(client.get("https://example.com").try_clone().is_some());
+    }
+
+    #[test]
+    fn test_load_ca_certificate_invalid_path() {
+        let result = load_ca_certificate(std::path::Path::new("/nonexistent/cert.pem"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_client_identity_invalid_spec() {
+        let result = load_client_identity("invalid_no_comma");
+        assert!(result.is_err());
+        match result {
+            Err(TransportError::Config(msg)) => {
+                assert!(msg.contains("cert_path,key_path"));
+            }
+            _ => panic!("Expected Config error"),
+        }
+    }
+
+    #[test]
+    fn test_registry_options_insecure() {
+        let mut ro = RegistryOptions::new();
+        ro.insecure_registries.push("my.registry".to_string());
+        assert!(ro.is_insecure("my.registry"));
+        assert!(ro.is_insecure("MY.REGISTRY")); // case insensitive
+        assert!(!ro.is_insecure("other.registry"));
+    }
+
+    #[test]
+    fn test_registry_options_skip_tls() {
+        let mut ro = RegistryOptions::new();
+        ro.skip_tls_verify_registries.push("skip-tls.registry".to_string());
+        assert!(ro.should_skip_tls_verify("skip-tls.registry"));
+        assert!(!ro.should_skip_tls_verify("other.registry"));
+    }
+
+    #[test]
+    fn test_registry_options_mirror() {
+        let mut ro = RegistryOptions::new();
+        ro.registry_mirrors.insert(
+            "docker.io".to_string(),
+            vec!["mirror.example.com".to_string()],
+        );
+        assert_eq!(ro.get_mirror("docker.io"), Some("mirror.example.com"));
+        assert_eq!(ro.get_mirror("gcr.io"), None);
+    }
+
+    #[test]
+    fn test_registry_options_remap_reference() {
+        let mut ro = RegistryOptions::new();
+        ro.registry_mirrors.insert(
+            "docker.io".to_string(),
+            vec!["mirror.example.com".to_string()],
+        );
+        assert_eq!(
+            ro.remap_reference("docker.io/library/nginx:latest"),
+            "mirror.example.com/library/nginx:latest"
+        );
+        assert_eq!(
+            ro.remap_reference("gcr.io/my-app:v1"),
+            "gcr.io/my-app:v1" // no mirror configured
+        );
     }
 }

@@ -9,7 +9,6 @@
 //! 6. Push manifest (PUT /v2/<name>/manifests/<reference>)
 
 use crate::auth::RegistryAuth;
-use crate::transport::build_client;
 use oci_image::manifest::MediaType;
 use oci_image::mutate::MutableImage;
 use thiserror::Error;
@@ -34,6 +33,10 @@ pub enum PushError {
 /// Result type for push operations.
 pub type Result<T> = std::result::Result<T, PushError>;
 
+/// User-Agent header value sent with all registry requests.
+/// Analogous to Go: `go-containerregistry` transport UserAgent.
+pub const USER_AGENT: &str = concat!("kaniko/", env!("CARGO_PKG_VERSION"));
+
 /// Options for controlling push behavior.
 #[derive(Debug, Clone)]
 pub struct PushOptions {
@@ -42,6 +45,16 @@ pub struct PushOptions {
     pub max_concurrent_uploads: usize,
     /// Whether to skip TLS verification.
     pub insecure: bool,
+    /// Whether to ignore errors from pushing to an immutable tag.
+    /// Some registries (e.g. ECR) return errors when pushing to a tag
+    /// that already exists and is immutable. When true, these errors
+    /// are logged as warnings instead of failing the push.
+    /// Analogous to Go: `opts.PushIgnoreImmutableTagErrors`.
+    pub ignore_immutable_tag_errors: bool,
+    /// Custom User-Agent header. Defaults to `kaniko/<version>`.
+    pub user_agent: String,
+    /// Registry-specific options (TLS, mirrors, certificates).
+    pub registry_options: Option<crate::transport::RegistryOptions>,
 }
 
 impl Default for PushOptions {
@@ -49,6 +62,9 @@ impl Default for PushOptions {
         Self {
             max_concurrent_uploads: 4,
             insecure: false,
+            ignore_immutable_tag_errors: false,
+            user_agent: USER_AGENT.to_string(),
+            registry_options: None,
         }
     }
 }
@@ -68,6 +84,24 @@ impl PushOptions {
             max_concurrent_uploads: max_concurrent,
             ..Default::default()
         }
+    }
+
+    /// Set whether to ignore immutable tag errors.
+    pub fn with_ignore_immutable_tag_errors(mut self, ignore: bool) -> Self {
+        self.ignore_immutable_tag_errors = ignore;
+        self
+    }
+
+    /// Set a custom User-Agent header.
+    pub fn with_user_agent(mut self, ua: &str) -> Self {
+        self.user_agent = ua.to_string();
+        self
+    }
+
+    /// Set registry-specific options.
+    pub fn with_registry_options(mut self, opts: crate::transport::RegistryOptions) -> Self {
+        self.registry_options = Some(opts);
+        self
     }
 }
 
@@ -125,8 +159,23 @@ pub async fn push_image_with_options(
     opts: PushOptions,
 ) -> Result<()> {
     let reference = Reference::parse(destination)?;
-    let base_url = reference.base_url(opts.insecure);
-    let client = build_client(opts.insecure);
+
+    // Determine if we should use insecure connection.
+    let insecure = opts.insecure
+        || opts
+            .registry_options
+            .as_ref()
+            .map_or(false, |ro| ro.is_insecure(&reference.registry));
+
+    let base_url = reference.base_url(insecure);
+
+    // Build client with User-Agent and registry-specific TLS settings.
+    let client = crate::transport::build_client_with_options(
+        insecure,
+        opts.registry_options.as_ref(),
+        &reference.registry,
+        &opts.user_agent,
+    );
 
     tracing::info!(
         "Pushing image to {} (concurrency: {})",
@@ -183,6 +232,7 @@ pub async fn push_image_with_options(
         .put(&manifest_url)
         .header("Authorization", &auth_header)
         .header("Content-Type", content_type)
+        .header("User-Agent", &opts.user_agent)
         .body(manifest_json)
         .send()
         .await?;
@@ -190,6 +240,21 @@ pub async fn push_image_with_options(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+
+        // Handle immutable tag errors.
+        // Some registries (e.g. ECR, GAR) return 400/409/405 when pushing
+        // to a tag that already exists and is immutable.
+        if opts.ignore_immutable_tag_errors && is_immutable_tag_error(status.as_u16(), &body) {
+            tracing::warn!(
+                "Tag {} is immutable in the destination registry, \
+                 ignoring error as requested: HTTP {} - {}",
+                reference.tag,
+                status,
+                body
+            );
+            return Ok(());
+        }
+
         return Err(PushError::Failed(format!(
             "manifest push failed: HTTP {} - {}",
             status, body
@@ -528,6 +593,22 @@ fn format_auth_header(token: &str) -> String {
     if token.is_empty() { String::new() } else { token.to_string() }
 }
 
+/// Check if the HTTP response indicates an immutable tag error.
+///
+/// Different registries use different status codes and error messages:
+/// - ECR: 400 with "IMMUTABLE_TAG" in the body
+/// - GAR: 409 with "TAG_IMMUTABLE" in the body
+/// - Generic: 405 Method Not Allowed for immutable tags
+fn is_immutable_tag_error(status_code: u16, body: &str) -> bool {
+    match status_code {
+        400 | 409 | 405 => {
+            let body_upper = body.to_uppercase();
+            body_upper.contains("IMMUTABLE") || body_upper.contains("TAG_ALREADY_EXISTS")
+        }
+        _ => false,
+    }
+}
+
 fn base64_encode(s: &str) -> String {
     // Simple base64 encoding without external dependency
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -602,5 +683,46 @@ mod tests {
     fn test_format_auth_header() {
         assert_eq!(format_auth_header(""), "");
         assert_eq!(format_auth_header("Bearer abc123"), "Bearer abc123");
+    }
+
+    #[test]
+    fn test_immutable_tag_error_detection() {
+        // ECR-style: 400 with IMMUTABLE_TAG
+        assert!(is_immutable_tag_error(400, r#"{"errors":[{"code":"IMMUTABLE_TAG"}]}"#));
+        // GAR-style: 409 with TAG_IMMUTABLE
+        assert!(is_immutable_tag_error(409, "TAG_IMMUTABLE: tag is immutable"));
+        // Generic: 405 Method Not Allowed
+        assert!(is_immutable_tag_error(405, "tag_already_exists: the tag already exists"));
+        // Case insensitive
+        assert!(is_immutable_tag_error(400, "immutable_tag: tag cannot be overwritten"));
+        // Non-immutable errors
+        assert!(!is_immutable_tag_error(400, "invalid manifest"));
+        assert!(!is_immutable_tag_error(401, "IMMUTABLE")); // wrong status code
+        assert!(!is_immutable_tag_error(404, "not found"));
+        assert!(!is_immutable_tag_error(500, "internal server error"));
+    }
+
+    #[test]
+    fn test_push_options_with_ignore_immutable() {
+        let opts = PushOptions::default().with_ignore_immutable_tag_errors(true);
+        assert!(opts.ignore_immutable_tag_errors);
+    }
+
+    #[test]
+    fn test_push_options_with_user_agent() {
+        let opts = PushOptions::default().with_user_agent("kaniko-test/1.0");
+        assert_eq!(opts.user_agent, "kaniko-test/1.0");
+    }
+
+    #[test]
+    fn test_push_options_with_registry_options() {
+        let ro = crate::transport::RegistryOptions::new();
+        let opts = PushOptions::default().with_registry_options(ro);
+        assert!(opts.registry_options.is_some());
+    }
+
+    #[test]
+    fn test_user_agent_constant() {
+        assert!(USER_AGENT.starts_with("kaniko/"));
     }
 }

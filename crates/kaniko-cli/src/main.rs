@@ -21,10 +21,14 @@ use kaniko_core::command::{
     UserCommand, VolumeCommand, WorkdirCommand, DockerCommand,
 };
 use kaniko_creds::keychain::SystemKeychain;
+use kaniko_snapshot::ignore_list::{
+    init_ignore_list, add_var_run_to_ignore_list, add_ignore_paths,
+};
 use oci_image::mutate::MutableImage;
 use oci_registry::auth::RegistryAuth;
 use oci_registry::pull::pull_image;
-use oci_registry::push::{push_image, PushOptions};
+use oci_registry::push::{push_image_with_options, PushOptions};
+use oci_registry::transport::RegistryOptions;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -72,8 +76,27 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ===== Validate flags =====
     validate_flags(&cli)?;
 
+    // ===== Initialize ignore list =====
+    // Analogous to Go: `util.InitIgnoreList()` + `--ignore-var-run` + `--ignore-path`.
+    init_ignore_list();
+    if cli.ignore_var_run {
+        add_var_run_to_ignore_list();
+    }
+    if !cli.ignore_path.is_empty() {
+        add_ignore_paths(&cli.ignore_path);
+    }
+    tracing::debug!("Ignore list initialized (ignore_var_run={}, {} custom paths)",
+        cli.ignore_var_run, cli.ignore_path.len());
+
+    // ===== Build registry options =====
+    let registry_options = build_registry_options(&cli);
+
     // ===== Resolve credentials =====
-    let keychain = SystemKeychain::new();
+    let keychain = if let Some(ref config_path) = cli.docker_config {
+        SystemKeychain::with_config_path(PathBuf::from(config_path))
+    } else {
+        SystemKeychain::new()
+    };
 
     // ===== Step 1: Parse Dockerfile =====
     let dockerfile_path = cli.dockerfile.as_deref().unwrap_or("Dockerfile");
@@ -109,7 +132,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let image = do_build(&cli, &stages, &context_path, &keychain).await?;
 
     // ===== Step 4: DoPush =====
-    do_push(&image, &cli, &keychain).await?;
+    do_push(&image, &cli, &keychain, &registry_options).await?;
 
     // ===== Step 5: Cleanup =====
     if cli.cleanup {
@@ -232,6 +255,7 @@ async fn do_push(
     image: &MutableImage,
     cli: &Cli,
     keychain: &SystemKeychain,
+    registry_options: &RegistryOptions,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Compute digest for output files
     let digest = image.digest().to_string();
@@ -281,14 +305,19 @@ async fn do_push(
         return Ok(());
     }
 
-    let push_opts = PushOptions::with_concurrency(4);
     for dest in &cli.destination {
         tracing::info!("Pushing image to {}", dest);
         let registry = extract_registry(dest);
+        let insecure = cli.insecure
+            || cli.insecure_registry.contains(&registry);
         let credential = keychain.credentials(&registry)
             .unwrap_or_else(|_| kaniko_creds::Credential::anonymous());
         let auth = RegistryAuth::new(&registry, credential)
-            .insecure(cli.insecure);
+            .insecure(insecure);
+
+        let push_opts = PushOptions::default()
+            .with_ignore_immutable_tag_errors(cli.push_ignore_immutable_tag_errors)
+            .with_registry_options(registry_options.clone());
 
         push_image_with_retry(image, dest, &auth, &push_opts, cli.push_retry).await?;
         tracing::info!("Pushed {}", dest);
@@ -390,14 +419,14 @@ async fn push_image_with_retry(
     image: &MutableImage,
     dest: &str,
     auth: &RegistryAuth,
-    _opts: &PushOptions,
+    opts: &PushOptions,
     max_retries: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut last_error = None;
     let attempts = if max_retries > 0 { max_retries + 1 } else { 1 };
 
     for attempt in 1..=attempts {
-        match push_image(image, dest, auth).await {
+        match push_image_with_options(image, dest, auth, opts.clone()).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 tracing::warn!("Push attempt {}/{} failed: {}", attempt, attempts, e);
@@ -688,6 +717,33 @@ fn cleanup_filesystem() {
             tracing::info!("Cleaned up {}", kaniko_dir);
         }
     }
+}
+
+/// Build RegistryOptions from CLI flags.
+/// Analogous to Go: `config.RegistryOptions` construction from flags.
+fn build_registry_options(cli: &Cli) -> RegistryOptions {
+    let mut opts = RegistryOptions::new();
+
+    // Insecure registries
+    opts.insecure_registries = cli.insecure_registry.clone();
+
+    // Skip TLS verify registries
+    opts.skip_tls_verify_registries = cli.skip_tls_verify_registry.clone();
+
+    // Registry mirrors
+    for mirror_spec in &cli.registry_mirror {
+        // Format: "registry=mirror" e.g. "docker.io=mirror.example.com"
+        if let Some((registry, mirror_url)) = mirror_spec.split_once('=') {
+            opts.registry_mirrors
+                .entry(registry.to_string())
+                .or_default()
+                .push(mirror_url.to_string());
+        } else {
+            tracing::warn!("Invalid registry mirror spec (expected registry=mirror): {}", mirror_spec);
+        }
+    }
+
+    opts
 }
 
 /// Write image as a Docker tar archive.

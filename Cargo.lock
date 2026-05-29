@@ -1063,6 +1063,7 @@ dependencies = [
  "hex",
  "nix",
  "oci-image",
+ "once_cell",
  "serde",
  "sha2",
  "tar",
