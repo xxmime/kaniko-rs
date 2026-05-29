@@ -9,4 +9,4 @@ pub mod timing;
 
 pub use error::KanikoError;
 pub use logging::init_tracing;
-pub use timing::{Timing, TimingRecord, DEFAULT_TIMER};
+pub use timing::{Timing, Timer, DEFAULT_RUN};

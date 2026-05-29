@@ -1078,6 +1078,7 @@ dependencies = [
 name = "kaniko-util"
 version = "0.1.0"
 dependencies = [
+ "once_cell",
  "serde_json",
  "thiserror",
  "tracing",

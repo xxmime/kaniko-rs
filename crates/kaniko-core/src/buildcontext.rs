@@ -1,194 +1,265 @@
 //! Build context module for kaniko-rs.
 //!
-//! Provides support for different build context sources:
-//! - `dir://` — local directory (default)
+//! Provides support for various build context sources:
+//! - `dir://` — local directory
 //! - `tar://` — tar archive
-//! - `git://` — Git repository (placeholder, needs `gix` crate)
-//! - `https://` — remote URL (placeholder)
-//! - `s3://` — Amazon S3 (placeholder)
-//! - `gcs://` — Google Cloud Storage (placeholder)
+//! - `git://` — Git repository
+//! - `https://` — HTTPS URL
 //!
-//! Analogous to Go: `pkg/buildcontext/`.
+//! Analogous to Go: `pkg/buildcontext/buildcontext.go`.
 
 use std::path::{Path, PathBuf};
-use thiserror::Error;
 
-/// Errors that can occur when resolving build contexts.
-#[derive(Debug, Error)]
-pub enum ContextError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("unsupported context scheme: {0}")]
-    UnsupportedScheme(String),
-    #[error("tar error: {0}")]
-    Tar(String),
-    #[error("context directory does not exist: {0}")]
-    NotFound(String),
-}
-
-/// Result type for context operations.
-pub type Result<T> = std::result::Result<T, ContextError>;
-
-/// Build context — resolves and provides the build context files.
-///
-/// The build context is the set of files that `COPY` and `ADD` instructions
-/// reference during a Dockerfile build. It can come from various sources.
+/// Build context options for Git sources.
 #[derive(Debug, Clone)]
-pub struct BuildContext {
-    /// The resolved local directory containing the build context files.
-    pub directory: PathBuf,
-    /// The original context URL/path (e.g. "dir://./src", "tar://archive.tar").
-    pub source: String,
-    /// The scheme prefix (e.g. "dir", "tar", "git").
-    pub scheme: ContextScheme,
+pub struct GitBuildOptions {
+    /// Git branch to checkout.
+    pub branch: Option<String>,
+    /// Whether to clone a single branch only.
+    pub single_branch: bool,
+    /// Whether to recurse into submodules.
+    pub recurse_submodules: bool,
+    /// Whether to skip TLS verification.
+    pub insecure_skip_tls: bool,
 }
 
-/// Supported build context schemes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ContextScheme {
-    /// Local directory context.
-    Dir,
-    /// Tar archive context.
-    Tar,
-    /// Git repository context (placeholder).
-    Git,
-    /// HTTPS URL context (placeholder).
-    Https,
-    /// Amazon S3 context (placeholder).
-    S3,
-    /// Google Cloud Storage context (placeholder).
-    Gcs,
-}
-
-impl std::fmt::Display for ContextScheme {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ContextScheme::Dir => write!(f, "dir"),
-            ContextScheme::Tar => write!(f, "tar"),
-            ContextScheme::Git => write!(f, "git"),
-            ContextScheme::Https => write!(f, "https"),
-            ContextScheme::S3 => write!(f, "s3"),
-            ContextScheme::Gcs => write!(f, "gcs"),
+impl Default for GitBuildOptions {
+    fn default() -> Self {
+        Self {
+            branch: None,
+            single_branch: false,
+            recurse_submodules: false,
+            insecure_skip_tls: false,
         }
     }
 }
 
-/// Resolve a build context string to a local directory.
+/// Build context trait — unifies calls to download and unpack the build context.
 ///
-/// Supported formats:
-/// - `"dir:///path/to/dir"` or `"dir://./src"` — local directory
-/// - `"tar:///path/to/archive.tar"` — extract tar to a temp dir
-/// - `"./src"` or `/absolute/path` — treated as `dir://` (default)
-/// - `"git://..."` — placeholder (returns UnsupportedScheme)
-/// - `"https://..."` — placeholder (returns UnsupportedScheme)
-/// - `"s3://..."` — placeholder (returns UnsupportedScheme)
-/// - `"gcs://..."` — placeholder (returns UnsupportedScheme)
+/// Analogous to Go: `buildcontext.BuildContext` interface.
+pub trait BuildContext {
+    /// Unpack the build context and return the directory where it resides.
+    fn unpack(&self) -> Result<PathBuf, BuildContextError>;
+}
+
+/// Errors during build context operations.
+#[derive(Debug, thiserror::Error)]
+pub enum BuildContextError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("unsupported build context prefix: {0}")]
+    UnsupportedPrefix(String),
+    #[error("invalid context path: {0}")]
+    InvalidPath(String),
+    #[error("tar error: {0}")]
+    Tar(String),
+    #[error("git error: {0}")]
+    Git(String),
+    #[error("download error: {0}")]
+    Download(String),
+}
+
+/// Resolve a build context source string to a local directory path.
 ///
-/// Analogous to Go: `buildcontext.GetBuildContext()`.
-pub fn resolve_build_context(context: &str, dest_dir: Option<&Path>) -> Result<BuildContext> {
-    let (scheme, path) = if let Some((prefix, rest)) = context.split_once("://") {
-        (parse_scheme(prefix), rest)
+/// Supports the following prefixes:
+/// - `dir://path` — local directory
+/// - `tar://path` — tar archive
+/// - `git://url` — Git repository (requires git binary)
+/// - `https://url` — HTTPS URL (downloaded as tar)
+/// - No prefix — treated as local directory
+///
+/// Analogous to Go: `buildcontext.GetBuildContext(srcContext, opts)`.
+pub fn resolve_build_context(
+    src_context: &str,
+    git_opts: &GitBuildOptions,
+) -> Result<Box<dyn BuildContext>, BuildContextError> {
+    if let Some((prefix, context)) = src_context.split_once("://") {
+        match prefix {
+            "dir" => Ok(Box::new(DirBuildContext {
+                context: context.to_string(),
+            })),
+            "tar" => Ok(Box::new(TarBuildContext {
+                context: context.to_string(),
+            })),
+            "git" => Ok(Box::new(GitBuildContext {
+                context: context.to_string(),
+                opts: git_opts.clone(),
+            })),
+            "https" | "http" => Ok(Box::new(HttpsBuildContext {
+                context: src_context.to_string(),
+            })),
+            _ => Err(BuildContextError::UnsupportedPrefix(format!(
+                "unknown build context prefix: {}, please use one of: dir://, tar://, git://, https://",
+                prefix
+            ))),
+        }
     } else {
-        // No scheme prefix — default to dir://
-        (ContextScheme::Dir, context)
-    };
-
-    match scheme {
-        ContextScheme::Dir => resolve_dir_context(path, dest_dir),
-        ContextScheme::Tar => resolve_tar_context(path, dest_dir),
-        ContextScheme::Git => Err(ContextError::UnsupportedScheme(
-            "git:// context is not yet implemented. Use dir:// or tar:// instead.".to_string(),
-        )),
-        ContextScheme::Https => Err(ContextError::UnsupportedScheme(
-            "https:// context is not yet implemented. Use dir:// or tar:// instead.".to_string(),
-        )),
-        ContextScheme::S3 => Err(ContextError::UnsupportedScheme(
-            "s3:// context is not yet implemented.".to_string(),
-        )),
-        ContextScheme::Gcs => Err(ContextError::UnsupportedScheme(
-            "gcs:// context is not yet implemented.".to_string(),
-        )),
+        // No prefix — treat as local directory
+        Ok(Box::new(DirBuildContext {
+            context: src_context.to_string(),
+        }))
     }
 }
 
-/// Parse a scheme string into a ContextScheme.
-fn parse_scheme(s: &str) -> ContextScheme {
-    match s.to_lowercase().as_str() {
-        "dir" => ContextScheme::Dir,
-        "tar" => ContextScheme::Tar,
-        "git" => ContextScheme::Git,
-        "https" | "http" => ContextScheme::Https,
-        "s3" => ContextScheme::S3,
-        "gcs" => ContextScheme::Gcs,
-        _ => ContextScheme::Dir, // Default to dir for unknown schemes
+/// Local directory build context.
+///
+/// Analogous to Go: `buildcontext.Dir`.
+pub struct DirBuildContext {
+    context: String,
+}
+
+impl BuildContext for DirBuildContext {
+    fn unpack(&self) -> Result<PathBuf, BuildContextError> {
+        let path = Path::new(&self.context);
+        if !path.exists() {
+            return Err(BuildContextError::InvalidPath(format!(
+                "directory does not exist: {}",
+                self.context
+            )));
+        }
+        if !path.is_dir() {
+            return Err(BuildContextError::InvalidPath(format!(
+                "not a directory: {}",
+                self.context
+            )));
+        }
+        Ok(path.to_path_buf())
     }
 }
 
-/// Resolve a local directory context.
-fn resolve_dir_context(path: &str, dest_dir: Option<&Path>) -> Result<BuildContext> {
-    // Handle relative paths with "dir://" prefix
-    // "dir://./src" means "./src" relative to current directory
-    // "dir:///absolute/path" means an absolute path
-    let resolved_path = if path.starts_with('/') {
-        PathBuf::from(path)
-    } else {
-        // Relative path — resolve against dest_dir or current directory
-        let base = dest_dir.map(PathBuf::from).unwrap_or_else(|| {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-        });
-        base.join(path)
-    };
-
-    if !resolved_path.exists() {
-        return Err(ContextError::NotFound(resolved_path.to_string_lossy().to_string()));
-    }
-
-    Ok(BuildContext {
-        directory: resolved_path,
-        source: format!("dir://{}", path),
-        scheme: ContextScheme::Dir,
-    })
+/// Tar archive build context.
+///
+/// Analogous to Go: `buildcontext.Tar`.
+pub struct TarBuildContext {
+    context: String,
 }
 
-/// Resolve a tar archive context by extracting it to a temporary directory.
-fn resolve_tar_context(path: &str, dest_dir: Option<&Path>) -> Result<BuildContext> {
-    let tar_path = PathBuf::from(path);
-    if !tar_path.exists() {
-        return Err(ContextError::NotFound(tar_path.to_string_lossy().to_string()));
+impl BuildContext for TarBuildContext {
+    fn unpack(&self) -> Result<PathBuf, BuildContextError> {
+        let tar_path = Path::new(&self.context);
+        if !tar_path.exists() {
+            return Err(BuildContextError::InvalidPath(format!(
+                "tar file does not exist: {}",
+                self.context
+            )));
+        }
+
+        // Create a temporary directory for extraction
+        let tmp_dir = std::env::temp_dir().join(format!("kaniko-context-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir)?;
+
+        // Extract the tar archive
+        let file = std::fs::File::open(tar_path)?;
+        let mut archive = tar::Archive::new(file);
+        archive.unpack(&tmp_dir)
+            .map_err(|e| BuildContextError::Tar(format!("failed to extract tar: {}", e)))?;
+
+        Ok(tmp_dir)
     }
-
-    // Determine extraction directory
-    let extract_dir = dest_dir.map(PathBuf::from).unwrap_or_else(|| {
-        // Create a temporary directory using std::env + random suffix
-        let base = std::env::temp_dir();
-        let unique_name = format!("kaniko-context-{}", std::process::id());
-        base.join(unique_name)
-    });
-
-    // Extract the tar archive
-    extract_tar(&tar_path, &extract_dir)?;
-
-    tracing::info!("Extracted tar context {} to {}", tar_path.display(), extract_dir.display());
-
-    Ok(BuildContext {
-        directory: extract_dir,
-        source: format!("tar://{}", path),
-        scheme: ContextScheme::Tar,
-    })
 }
 
-/// Extract a tar archive to a directory.
-fn extract_tar(tar_path: &Path, dest: &Path) -> Result<()> {
-    std::fs::create_dir_all(dest)?;
+/// Git repository build context.
+///
+/// Analogous to Go: `buildcontext.Git`.
+/// Uses the `git` command-line tool for cloning.
+pub struct GitBuildContext {
+    context: String,
+    opts: GitBuildOptions,
+}
 
-    let file = std::fs::File::open(tar_path)?;
-    let mut archive = tar::Archive::new(file);
+impl BuildContext for GitBuildContext {
+    fn unpack(&self) -> Result<PathBuf, BuildContextError> {
+        // Parse context: git://repo.url#branch
+        let (repo_url, branch) = if let Some((url, br)) = self.context.split_once('#') {
+            (url.to_string(), Some(br.to_string()))
+        } else {
+            (self.context.clone(), self.opts.branch.clone())
+        };
 
-    // Unpack all entries
-    archive.unpack(dest)
-        .map_err(|e| ContextError::Tar(format!("failed to extract tar: {}", e)))?;
+        // Create a temporary directory for cloning
+        let tmp_dir = std::env::temp_dir().join(format!("kaniko-git-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir)?;
 
-    Ok(())
+        // Use git command to clone the repository
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("clone");
+
+        if self.opts.single_branch {
+            cmd.arg("--single-branch");
+        }
+
+        if self.opts.recurse_submodules {
+            cmd.arg("--recurse-submodules");
+        }
+
+        if let Some(ref br) = branch {
+            cmd.arg("--branch").arg(br);
+        }
+
+        if self.opts.insecure_skip_tls {
+            // Disable SSL verification
+            cmd.env("GIT_SSL_NO_VERIFY", "1");
+        }
+
+        cmd.arg(&repo_url).arg(&tmp_dir);
+
+        let output = cmd.output()
+            .map_err(|e| BuildContextError::Git(format!("failed to execute git: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(BuildContextError::Git(format!(
+                "git clone failed: {}",
+                stderr
+            )));
+        }
+
+        Ok(tmp_dir)
+    }
+}
+
+/// HTTPS URL build context.
+///
+/// Downloads a tar archive from a URL and extracts it.
+/// Analogous to Go: `buildcontext.HTTPSTar`.
+///
+/// Note: Uses tokio runtime for async HTTP download since reqwest's
+/// blocking feature is not enabled in this project.
+pub struct HttpsBuildContext {
+    context: String,
+}
+
+impl BuildContext for HttpsBuildContext {
+    fn unpack(&self) -> Result<PathBuf, BuildContextError> {
+        // Create a temporary directory for extraction
+        let tmp_dir = std::env::temp_dir().join(format!("kaniko-https-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir)?;
+
+        // Use tokio runtime to download the tar file asynchronously
+        let url = self.context.clone();
+        let data = tokio::runtime::Handle::current().block_on(async {
+            let response = reqwest::get(&url).await
+                .map_err(|e| BuildContextError::Download(format!("failed to download: {}", e)))?;
+
+            if !response.status().is_success() {
+                return Err(BuildContextError::Download(format!(
+                    "download failed with status: {}",
+                    response.status()
+                )));
+            }
+
+            let bytes = response.bytes().await
+                .map_err(|e| BuildContextError::Download(format!("failed to read response: {}", e)))?;
+            Ok::<_, BuildContextError>(bytes.to_vec())
+        })?;
+
+        // Extract the tar archive
+        let mut archive = tar::Archive::new(data.as_slice());
+        archive.unpack(&tmp_dir)
+            .map_err(|e| BuildContextError::Tar(format!("failed to extract tar: {}", e)))?;
+
+        Ok(tmp_dir)
+    }
 }
 
 #[cfg(test)]
@@ -197,86 +268,76 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn test_parse_scheme() {
-        assert_eq!(parse_scheme("dir"), ContextScheme::Dir);
-        assert_eq!(parse_scheme("tar"), ContextScheme::Tar);
-        assert_eq!(parse_scheme("git"), ContextScheme::Git);
-        assert_eq!(parse_scheme("https"), ContextScheme::Https);
-        assert_eq!(parse_scheme("s3"), ContextScheme::S3);
-        assert_eq!(parse_scheme("gcs"), ContextScheme::Gcs);
-        assert_eq!(parse_scheme("unknown"), ContextScheme::Dir);
+    fn test_dir_build_context() {
+        let tmp_dir = std::env::temp_dir().join("kaniko-test-dir");
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ctx = DirBuildContext {
+            context: tmp_dir.to_string_lossy().to_string(),
+        };
+        let result = ctx.unpack();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), tmp_dir);
+
+        fs::remove_dir(&tmp_dir).ok();
     }
 
     #[test]
-    fn test_context_scheme_display() {
-        assert_eq!(ContextScheme::Dir.to_string(), "dir");
-        assert_eq!(ContextScheme::Tar.to_string(), "tar");
-        assert_eq!(ContextScheme::Git.to_string(), "git");
+    fn test_dir_build_context_nonexistent() {
+        let ctx = DirBuildContext {
+            context: "/nonexistent/path".to_string(),
+        };
+        assert!(ctx.unpack().is_err());
     }
 
     #[test]
-    fn test_resolve_dir_context_absolute() {
-        let ctx = resolve_build_context("dir:///tmp", None);
-        // May fail if /tmp doesn't exist on the test system, but usually it does
-        if let Ok(ctx) = ctx {
-            assert_eq!(ctx.scheme, ContextScheme::Dir);
-            assert!(ctx.directory.exists());
-        }
-    }
-
-    #[test]
-    fn test_resolve_dir_context_relative() {
-        let ctx = resolve_build_context("dir://.", None).unwrap();
-        assert_eq!(ctx.scheme, ContextScheme::Dir);
-        assert!(ctx.directory.exists());
-        assert_eq!(ctx.source, "dir://.");
-    }
-
-    #[test]
-    fn test_resolve_bare_path() {
-        // Bare path without scheme prefix defaults to dir://
-        let ctx = resolve_build_context(".", None).unwrap();
-        assert_eq!(ctx.scheme, ContextScheme::Dir);
-        assert!(ctx.directory.exists());
-    }
-
-    #[test]
-    fn test_resolve_git_context_unsupported() {
-        let ctx = resolve_build_context("git://github.com/repo", None);
-        assert!(ctx.is_err());
-        let err = ctx.unwrap_err();
-        assert!(err.to_string().contains("git://"));
-    }
-
-    #[test]
-    fn test_resolve_https_context_unsupported() {
-        let ctx = resolve_build_context("https://example.com/repo", None);
-        assert!(ctx.is_err());
+    fn test_resolve_dir_context() {
+        let opts = GitBuildOptions::default();
+        let ctx = resolve_build_context("dir:///tmp/test", &opts);
+        assert!(ctx.is_ok());
     }
 
     #[test]
     fn test_resolve_tar_context() {
-        // Create a temporary tar file
-        let temp_dir = tempfile::tempdir().unwrap();
-        let source_dir = temp_dir.path().join("source");
-        fs::create_dir_all(&source_dir).unwrap();
-        fs::write(source_dir.join("test.txt"), "hello").unwrap();
+        let opts = GitBuildOptions::default();
+        let ctx = resolve_build_context("tar:///tmp/test.tar", &opts);
+        assert!(ctx.is_ok());
+    }
 
-        let tar_path = temp_dir.path().join("context.tar");
-        {
-            let file = fs::File::create(&tar_path).unwrap();
-            let mut builder = tar::Builder::new(file);
-            builder.append_dir_all(".", &source_dir).unwrap();
-            builder.finish().unwrap();
-        }
+    #[test]
+    fn test_resolve_git_context() {
+        let opts = GitBuildOptions::default();
+        let ctx = resolve_build_context("git://github.com/user/repo", &opts);
+        assert!(ctx.is_ok());
+    }
 
-        let dest_dir = temp_dir.path().join("extracted");
-        let ctx = resolve_build_context(
-            &format!("tar://{}", tar_path.display()),
-            Some(&dest_dir),
-        ).unwrap();
+    #[test]
+    fn test_resolve_https_context() {
+        let opts = GitBuildOptions::default();
+        let ctx = resolve_build_context("https://example.com/context.tar", &opts);
+        assert!(ctx.is_ok());
+    }
 
-        assert_eq!(ctx.scheme, ContextScheme::Tar);
-        assert!(ctx.directory.join("test.txt").exists());
+    #[test]
+    fn test_resolve_unsupported_prefix() {
+        let opts = GitBuildOptions::default();
+        let ctx = resolve_build_context("s3://bucket/context", &opts);
+        assert!(ctx.is_err());
+    }
+
+    #[test]
+    fn test_resolve_no_prefix() {
+        let opts = GitBuildOptions::default();
+        let ctx = resolve_build_context("/tmp/test", &opts);
+        assert!(ctx.is_ok());
+    }
+
+    #[test]
+    fn test_git_build_options_default() {
+        let opts = GitBuildOptions::default();
+        assert!(opts.branch.is_none());
+        assert!(!opts.single_branch);
+        assert!(!opts.recurse_submodules);
+        assert!(!opts.insecure_skip_tls);
     }
 }

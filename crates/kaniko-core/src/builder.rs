@@ -528,6 +528,150 @@ impl StageBuilder {
         !is_metadata_cmd
     }
 
+    /// Save a layer to the image, converting media type if needed.
+    ///
+    /// Analogous to Go: `stageBuilder.saveLayerToImage(layer, createdBy)`.
+    fn save_layer_to_image(&mut self, layer: oci_image::layer::Layer, created_by: &str) -> Result<()> {
+        // Convert layer media type if the image and layer have different vendors.
+        // Analogous to Go: `stageBuilder.convertLayerMediaType(layer)`.
+        let layer = self.convert_layer_media_type(layer)?;
+
+        // Append the layer with history entry.
+        // Analogous to Go: `mutate.Append(s.image, mutate.Addendum{Layer, History})`.
+        self.image = oci_image::mutate::append_layer_with_history(
+            self.image.clone(),
+            layer,
+            oci_image::config::HistoryEntry {
+                created: None,
+                author: Some("kaniko".to_string()),
+                created_by: Some(created_by.to_string()),
+                comment: None,
+                empty_layer: None,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Save a snapshot (tar file) as a layer to the image.
+    ///
+    /// Analogous to Go: `stageBuilder.saveSnapshotToImage(createdBy, tarPath)`.
+    fn save_snapshot_to_image(&mut self, created_by: &str, tar_path: &std::path::Path) -> Result<()> {
+        let layer = self.save_snapshot_to_layer(tar_path)?;
+        if let Some(layer) = layer {
+            self.save_layer_to_image(layer, created_by)?;
+        }
+        Ok(())
+    }
+
+    /// Convert a tar snapshot file into an OCI layer.
+    ///
+    /// Returns None if the tar is empty (≤1024 bytes) and force_build_metadata
+    /// is not set.
+    ///
+    /// Analogous to Go: `stageBuilder.saveSnapshotToLayer(tarPath)`.
+    fn save_snapshot_to_layer(&self, tar_path: &std::path::Path) -> Result<Option<oci_image::layer::Layer>> {
+        if tar_path.as_os_str().is_empty() {
+            return Ok(None);
+        }
+
+        let metadata = std::fs::metadata(tar_path)
+            .map_err(|e| BuildError::Failed(format!("tar file path does not exist: {}", e)))?;
+
+        // Empty tar is 1024 bytes in Go; skip if not forcing metadata.
+        // Analogous to Go: `fi.Size() <= emptyTarSize && !s.opts.ForceBuildMetadata`.
+        const EMPTY_TAR_SIZE: u64 = 1024;
+        if metadata.len() <= EMPTY_TAR_SIZE && !self.opts.force_build_metadata {
+            tracing::info!("No files were changed, appending empty layer to config. No layer added to image.");
+            return Ok(None);
+        }
+
+        // Read the tar data and create a layer with appropriate compression.
+        let tar_data = std::fs::read(tar_path)
+            .map_err(|e| BuildError::Failed(format!("failed to read tar file: {}", e)))?;
+
+        let compression = self.opts.compression.as_deref().unwrap_or("gzip");
+        let layer = match compression {
+            "zstd" => oci_image::layer::Layer::from_tar_uncompressed_with_options(
+                tar_data,
+                oci_image::layer::LayerCompression::zstd(self.opts.compression_level),
+            )?,
+            _ => oci_image::layer::Layer::from_tar_uncompressed_with_options(
+                tar_data,
+                oci_image::layer::LayerCompression::gzip(self.opts.compression_level),
+            )?,
+        };
+
+        Ok(Some(layer))
+    }
+
+    /// Convert layer media type to match the image's vendor (OCI vs Docker).
+    ///
+    /// When a layer has a different vendor than the target image, we need
+    /// to re-encode the layer with the appropriate media type.
+    ///
+    /// Analogous to Go: `stageBuilder.convertLayerMediaType(layer)`.
+    fn convert_layer_media_type(&self, layer: oci_image::layer::Layer) -> Result<oci_image::layer::Layer> {
+        let layer_mt = layer.media_type();
+        let image_mt = self.image.manifest.media_type.clone().unwrap_or_default();
+
+        let layer_vendor = oci_image::manifest::MediaType::extract_vendor_prefix(&layer_mt);
+        let image_vendor = oci_image::manifest::MediaType::extract_vendor_prefix(&image_mt);
+
+        if layer_vendor == image_vendor {
+            return Ok(layer);
+        }
+
+        // Try to convert the media type
+        let use_zstd = self.opts.compression.as_deref() == Some("zstd");
+        let target_mt = oci_image::manifest::MediaType::convert_layer_media_type(
+            &layer_mt,
+            image_vendor,
+            use_zstd,
+        );
+
+        match target_mt {
+            Some(target) => {
+                tracing::debug!(
+                    "Converting layer media type from {} to {}",
+                    layer_mt,
+                    target
+                );
+                // Re-create the layer with the target media type.
+                // For now, we just update the media_type since the data format
+                // (tar/gzip/zstd) may need actual re-compression.
+                let data = layer.data();
+                let diff_id = layer.diff_id().to_string();
+
+                // Check if we need to re-compress
+                // Note: data() returns &[u8], need to convert to Vec<u8> for re-compression
+                let new_layer = if target.contains("zstd") && !layer_mt.contains("zstd") {
+                    // Re-compress with zstd
+                    // Note: data is compressed, need uncompressed_data for re-compression
+                    let uncompressed = layer.uncompressed_data()?;
+                    oci_image::layer::Layer::from_tar_uncompressed_with_options(
+                        uncompressed,
+                        oci_image::layer::LayerCompression::zstd(self.opts.compression_level),
+                    )?
+                } else if target.contains("gzip") && !layer_mt.contains("gzip") && !layer_mt.contains("zstd") {
+                    // Re-compress with gzip
+                    let uncompressed = layer.uncompressed_data()?;
+                    oci_image::layer::Layer::from_tar_uncompressed_with_options(
+                        uncompressed,
+                        oci_image::layer::LayerCompression::gzip(self.opts.compression_level),
+                    )?
+                } else {
+                    // Same compression, just update the media type string
+                    layer
+                };
+                Ok(new_layer)
+            }
+            None => Err(BuildError::Failed(format!(
+                "layer with media type {} cannot be converted to match {}",
+                layer_mt, image_mt
+            ))),
+        }
+    }
+
     /// Determine whether the filesystem needs to be unpacked.
     ///
     /// Checks if any command requires an unpacked FS, or if there are

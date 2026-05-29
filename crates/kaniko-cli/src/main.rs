@@ -46,17 +46,21 @@ async fn main() {
     apply_sandbox(cli.sandbox);
 
     // Start build timing
-    kaniko_util::timing::DEFAULT_TIMER.start("total_build");
+    let total_timer = kaniko_util::timing::start("total_build");
 
     match run(cli).await {
         Ok(()) => {
-            kaniko_util::timing::DEFAULT_TIMER.stop("total_build");
-            kaniko_util::timing::DEFAULT_TIMER.log_all();
+            kaniko_util::timing::stop(total_timer);
+            if let Ok(timing) = kaniko_util::timing::DEFAULT_RUN.lock() {
+                tracing::info!("{}", timing.format_all());
+            }
             tracing::info!("Build completed successfully");
         }
         Err(e) => {
-            kaniko_util::timing::DEFAULT_TIMER.stop("total_build");
-            kaniko_util::timing::DEFAULT_TIMER.log_all();
+            kaniko_util::timing::stop(total_timer);
+            if let Ok(timing) = kaniko_util::timing::DEFAULT_RUN.lock() {
+                tracing::info!("{}", timing.format_all());
+            }
             tracing::error!("Build failed: {}", e);
             std::process::exit(1);
         }

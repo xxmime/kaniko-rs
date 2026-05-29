@@ -19,4 +19,4 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Re-export commonly used types
 pub use builder::StageBuilder;
 pub use multistage_builder::MultiStageBuilder;
-pub use buildcontext::{BuildContext, ContextScheme, ContextError, resolve_build_context};
+pub use buildcontext::{BuildContext, BuildContextError, GitBuildOptions, resolve_build_context};

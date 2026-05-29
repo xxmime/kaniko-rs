@@ -359,6 +359,24 @@ pub struct LayerCompression {
     pub level: i32,
 }
 
+impl LayerCompression {
+    /// Create a gzip compression option with the given level.
+    pub fn gzip(level: u32) -> Self {
+        Self {
+            algorithm: CompressionAlgorithm::Gzip,
+            level: level as i32,
+        }
+    }
+
+    /// Create a zstd compression option with the given level.
+    pub fn zstd(level: u32) -> Self {
+        Self {
+            algorithm: CompressionAlgorithm::Zstd,
+            level: level as i32,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
