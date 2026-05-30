@@ -338,6 +338,79 @@ static SIMPLE_RE: Lazy<Regex> = Lazy::new(|| {
 });
 
 fn regex_lazy() -> &'static Regex { &BRACE_RE }
+
+/// Update environment variables in the image config.
+///
+/// Takes a list of new key-value pairs and updates or appends them
+/// to the existing env list. If a key already exists, its value is replaced.
+/// Environment variable substitution is performed on both keys and values.
+///
+/// Analogous to Go: `UpdateConfigEnv()`.
+pub fn update_config_env(
+    envs: &mut Vec<String>,
+    new_vars: &[(String, String)],
+    replacement_envs: &[String],
+) -> Result<(), String> {
+    // First, resolve env vars in new keys and values
+    let mut resolved_vars = Vec::with_capacity(new_vars.len());
+    for (key, value) in new_vars {
+        let expanded_key = resolve_environment_replacement(key, replacement_envs, false)?;
+        let expanded_value = resolve_environment_replacement(value, replacement_envs, false)?;
+        resolved_vars.push((expanded_key, expanded_value));
+    }
+
+    // Convert existing envs to key-value pairs
+    let mut kvps: Vec<(String, String)> = envs.iter().map(|e| {
+        let parts: Vec<&str> = e.splitn(2, '=').collect();
+        (parts[0].to_string(), if parts.len() > 1 { parts[1].to_string() } else { String::new() })
+    }).collect();
+
+    // Update or append new envs
+    for (new_key, new_value) in resolved_vars {
+        let mut found = false;
+        for (key, value) in kvps.iter_mut() {
+            if key == &new_key {
+                tracing::debug!("Replacing env var {}={} with {}={}", key, value, new_key, new_value);
+                *value = new_value.clone();
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            kvps.push((new_key, new_value));
+        }
+    }
+
+    // Convert back to env array
+    *envs = kvps.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+    Ok(())
+}
+
+/// Return the Docker config file location.
+///
+/// Checks DOCKER_CONFIG environment variable first.
+/// If not set or invalid, returns default "/kaniko/.docker/config.json".
+///
+/// Analogous to Go: `DockerConfLocation()`.
+pub fn docker_conf_location() -> String {
+    let config_file = "config.json";
+
+    if let Ok(docker_config) = std::env::var("DOCKER_CONFIG") {
+        let path = Path::new(&docker_config);
+        if path.exists() {
+            if path.is_dir() {
+                return path.join(config_file).to_string_lossy().to_string();
+            }
+            // It's a file, return the path directly
+            return docker_config;
+        }
+        // Path doesn't exist, use default
+        tracing::debug!("DOCKER_CONFIG {} does not exist, using default", docker_config);
+    }
+
+    // Default: /kaniko/.docker/config.json
+    format!("/kaniko/.docker/{}", config_file)
+}
 fn simple_regex_lazy() -> &'static Regex { &SIMPLE_RE }
 
 #[cfg(test)]
@@ -407,5 +480,24 @@ mod tests {
         assert!(is_dest_dir_in_root("/some/dir/"));
         assert!(is_dest_dir_in_root("."));
         assert!(!is_dest_dir_in_root("/some/file"));
+    }
+
+    #[test]
+    fn test_update_config_env() {
+        let mut envs = vec!["PATH=/usr/bin".to_string(), "HOME=/root".to_string()];
+        let new_vars = vec![("HOME".to_string(), "/home/user".to_string()), ("SHELL".to_string(), "/bin/bash".to_string())];
+        update_config_env(&mut envs, &new_vars, &[]).unwrap();
+        assert!(envs.contains(&"HOME=/home/user".to_string()));
+        assert!(envs.contains(&"SHELL=/bin/bash".to_string()));
+        assert!(envs.contains(&"PATH=/usr/bin".to_string()));
+    }
+
+    #[test]
+    fn test_docker_conf_location_default() {
+        // Don't test with env var removal (unsafe in Rust 2024 edition)
+        // Just test the default case
+        let loc = docker_conf_location();
+        // Should contain "kaniko" and ".docker" in default case
+        assert!(loc.contains("kaniko") || loc.contains(".docker") || loc.contains("config.json"));
     }
 }

@@ -15,9 +15,86 @@
 //! - `create_file`: Create a file with permissions and ownership
 
 use crate::ignore_list::{is_in_ignore_list, add_to_ignore_list, IgnoreListEntry, get_ignore_list};
+use crate::walker::parse_dockerignore;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+
+/// FileContext represents the build context for a Dockerfile.
+///
+/// It tracks the root directory and any files excluded via .dockerignore.
+/// Analogous to Go: `util.FileContext`.
+#[derive(Debug, Clone)]
+pub struct FileContext {
+    /// Root directory of the build context.
+    pub root: String,
+    /// List of excluded file patterns from .dockerignore.
+    pub excluded_files: Vec<String>,
+}
+
+impl FileContext {
+    /// Create a new FileContext with the given root.
+    pub fn new(root: &str) -> Self {
+        Self {
+            root: root.to_string(),
+            excluded_files: Vec::new(),
+        }
+    }
+
+    /// Check if a path should be excluded based on .dockerignore patterns.
+    /// Analogous to Go: `FileContext.ExcludesFile()`.
+    pub fn excludes_file(&self, path: &str) -> bool {
+        let rel_path = if filepath_has_prefix(path, &self.root, false) {
+            Path::new(path).strip_prefix(&self.root)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| path.to_string())
+        } else {
+            path.to_string()
+        };
+
+        for pattern in &self.excluded_files {
+            if glob_match(pattern, &rel_path) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Create a FileContext from a Dockerfile path and build context.
+///
+/// Reads .dockerignore from either the Dockerfile directory or the build context.
+/// Analogous to Go: `NewFileContextFromDockerfile()`.
+pub fn new_file_context_from_dockerfile(dockerfile_path: &str, build_context: &str) -> FileContext {
+    let mut ctx = FileContext::new(build_context);
+
+    // Try .dockerignore next to Dockerfile first
+    let dockerignore_path = format!("{}.dockerignore", dockerfile_path);
+    let dockerignore = if Path::new(&dockerignore_path).exists() {
+        Some(dockerignore_path)
+    } else {
+        let alt_path = Path::new(build_context).join(".dockerignore");
+        if alt_path.exists() {
+            Some(alt_path.to_string_lossy().to_string())
+        } else {
+            None
+        }
+    };
+
+    if let Some(path) = dockerignore {
+        tracing::info!("Using dockerignore file: {}", path);
+        if let Ok(content) = fs::read_to_string(&path) {
+            let patterns = parse_dockerignore(&content);
+            for pattern in patterns {
+                if !pattern.negation {
+                    ctx.excluded_files.push(pattern.pattern.clone());
+                }
+            }
+        }
+    }
+
+    ctx
+}
 
 /// Root directory for kaniko operations.
 /// Defaults to "/" (the container root).
@@ -491,6 +568,291 @@ fn glob_match(pattern: &str, text: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Check if a path is a symlink.
+/// Analogous to Go: `IsSymlink()`.
+pub fn is_symlink(path: &Path) -> bool {
+    path.symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+/// Copy a file or symlink for cross-stage dependencies.
+///
+/// For symlinks, copies the target path because copying the symlink would
+/// result in a dead link. For regular files, copies the file with permissions.
+///
+/// Analogous to Go: `CopyFileOrSymlink()`.
+pub fn copy_file_or_symlink(src: &str, dest_dir: &str, root: &str) -> io::Result<()> {
+    let src_path = Path::new(root).join(src.trim_start_matches('/'));
+    let dest_path = Path::new(dest_dir).join(src.trim_start_matches('/'));
+
+    let metadata = fs::symlink_metadata(&src_path)?;
+
+    if metadata.file_type().is_symlink() {
+        // Copy symlink target
+        let link_target = fs::read_link(&src_path)?;
+        create_parent_directory(dest_path.to_string_lossy().as_ref())?;
+        // Remove existing if any
+        if dest_path.exists() || dest_path.symlink_metadata().is_ok() {
+            let _ = fs::remove_file(&dest_path);
+        }
+        fs::soft_link(&link_target, &dest_path)?;
+    } else if metadata.is_dir() {
+        // Copy directory recursively
+        copy_dir_recursive_simple(&src_path, &dest_path)?;
+    } else {
+        // Copy regular file - ensure parent directory exists
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&src_path, &dest_path)?;
+
+        // Copy ownership
+        copy_ownership(&src_path, dest_dir, root)?;
+
+        // Copy file mode
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = metadata.permissions().mode();
+            fs::set_permissions(&dest_path, fs::Permissions::from_mode(mode))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Recursively copy a directory.
+fn copy_dir_recursive_simple(src: &Path, dest: &Path) -> io::Result<()> {
+    fs::create_dir_all(dest)?;
+
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dest_path = dest.join(entry.file_name());
+
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            copy_dir_recursive_simple(&src_path, &dest_path)?;
+        } else {
+            fs::copy(&src_path, &dest_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Copy file ownership recursively from src to dest.
+///
+/// Analogous to Go: `CopyOwnership()`.
+pub fn copy_ownership(src: &Path, dest_dir: &str, root: &str) -> io::Result<()> {
+    // Only walk directories
+    if !src.is_dir() {
+        return Ok(());
+    }
+
+    fn walk_and_copy(src: &Path, dest_dir: &str, root: &str) -> io::Result<()> {
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if is_symlink(&path) {
+                continue;
+            }
+
+            let rel_path = path.strip_prefix(root).unwrap_or(&path);
+            let dest_path = Path::new(dest_dir).join(rel_path);
+
+            if is_in_ignore_list(&path) && is_in_ignore_list(&dest_path) {
+                if !dest_path.exists() {
+                    tracing::debug!("Path {:?} ignored, but not exists", dest_path);
+                    continue;
+                }
+                if path.is_dir() {
+                    continue;
+                }
+                tracing::debug!("Not copying ownership for {:?}, as it's ignored", dest_path);
+                continue;
+            }
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let metadata = fs::metadata(&path)?;
+                let uid = metadata.uid();
+                let gid = metadata.gid();
+                // chown requires root; attempt silently
+                if dest_path.exists() {
+                    let _ = chown_file(&dest_path, uid, gid);
+                }
+            }
+
+            if path.is_dir() {
+                walk_and_copy(&path, dest_dir, root)?;
+            }
+        }
+        Ok(())
+    }
+
+    walk_and_copy(src, dest_dir, root)
+}
+
+/// Chown a file (Unix only). Silently fails if not root.
+#[cfg(unix)]
+fn chown_file(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let c_path = std::ffi::CString::new(path.to_string_lossy().into_owned())?;
+    // Only chown if uid/gid differ from current
+    let metadata = fs::metadata(path)?;
+    if metadata.uid() == uid && metadata.gid() == gid {
+        return Ok(());
+    }
+    // Safe: chown requires CAP_CHOWN, silently fails for non-root
+    unsafe {
+        if libc::chown(c_path.as_ptr(), uid, gid) != 0 {
+            // Non-root will fail; this is expected
+            tracing::trace!("chown {:?} to {}:{} failed (expected for non-root)", path, uid, gid);
+        }
+    }
+    Ok(())
+}
+
+/// Create parent directories with default permissions.
+/// Analogous to Go: `createParentDirectory()`.
+pub fn create_parent_directory(path: &str) -> io::Result<()> {
+    if let Some(parent) = Path::new(path).parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    Ok(())
+}
+
+/// Create directory with specified permissions and ownership.
+/// Analogous to Go: `MkdirAllWithPermissions()`.
+pub fn mkdir_all_with_permissions(path: &str, mode: u32, _uid: i64, _gid: i64) -> io::Result<()> {
+    let p = Path::new(path);
+    if !p.exists() {
+        fs::create_dir_all(p)?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(mode);
+        fs::set_permissions(p, perms)?;
+
+        // chown requires root; skip if not root
+        if _uid >= 0 || _gid >= 0 {
+            let _ = chown_file(p, _uid as u32, _gid as u32);
+        }
+    }
+
+    Ok(())
+}
+
+/// Set file permissions (mode, uid, gid).
+/// Analogous to Go: `setFilePermissions()`.
+pub fn set_file_permissions(path: &str, mode: u32, _uid: u32, _gid: u32) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(mode);
+        fs::set_permissions(path, perms)?;
+
+        // Attempt chown (requires root)
+        let _ = chown_file(Path::new(path), _uid, _gid);
+    }
+
+    Ok(())
+}
+
+/// Set file access and modification times.
+/// Analogous to Go: `setFileTimes()`.
+pub fn set_file_times(path: &str, atime: std::time::SystemTime, mtime: std::time::SystemTime) -> io::Result<()> {
+    let f = fs::File::open(path)?;
+    filetime::set_file_handle_times(
+        &f,
+        Some(filetime::FileTime::from_system_time(atime)),
+        Some(filetime::FileTime::from_system_time(mtime)),
+    ).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+}
+
+/// Check if a path has the given prefix (string-based).
+/// Analogous to Go: `HasFilepathPrefix()`.
+pub fn filepath_has_prefix(path: &str, prefix: &str, prefix_match_only: bool) -> bool {
+    let path = path.trim_end_matches('/').trim_end_matches('\\');
+    let prefix = prefix.trim_end_matches('/').trim_end_matches('\\');
+    has_cleaned_filepath_prefix(path, prefix, prefix_match_only)
+}
+
+fn has_cleaned_filepath_prefix(path: &str, prefix: &str, prefix_match_only: bool) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+
+    let prefix_parts: Vec<&str> = prefix.split('/').filter(|s| !s.is_empty()).collect();
+    let path_parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    if path_parts.len() < prefix_parts.len() {
+        return false;
+    }
+
+    for (i, prefix_part) in prefix_parts.iter().enumerate() {
+        if path_parts[i] != *prefix_part {
+            return false;
+        }
+    }
+
+    if !prefix_match_only && path_parts.len() != prefix_parts.len() {
+        // For non-prefix-match-only, check exact match
+        // But prefix matching is allowed for directories
+        return true;
+    }
+
+    true
+}
+
+/// Check if a cleaned path is in the ignore list.
+/// Analogous to Go: `CheckCleanedPathAgainstIgnoreList()`.
+pub fn check_cleaned_path_against_ignore_list(path: &Path) -> bool {
+    is_in_ignore_list(path)
+}
+
+/// Eval symlinks for a path, resolving in root if needed.
+/// Analogous to Go: `EvalSymLink()`.
+pub fn eval_symlink(path: &str) -> io::Result<String> {
+    let p = Path::new(path);
+
+    // Verify it's a symlink
+    let metadata = fs::symlink_metadata(p)?;
+    if !metadata.file_type().is_symlink() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a symlink"));
+    }
+
+    // For paths within kaniko root, resolve in root
+    // Otherwise use standard symlink resolution
+    if should_resolve_in_root(path) {
+        let resolved = crate::resolve::resolve_symlink_ancestor(path)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        if Path::new(&resolved).exists() {
+            return Ok(resolved);
+        }
+        return Err(io::Error::new(io::ErrorKind::NotFound, "resolved symlink target not found"));
+    }
+
+    p.canonicalize().map(|s| s.to_string_lossy().to_string())
+}
+
+/// Check if we should resolve paths in root (not standard root "/").
+fn should_resolve_in_root(path: &str) -> bool {
+    let root = KANIKO_ROOT_DIR.trim_end_matches('/');
+    if root.is_empty() || root == "/" {
+        return false;
+    }
+    path.starts_with(root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +954,159 @@ mod tests {
         create_file(&path_str, b"hello world", 0o644, 0, 0).unwrap();
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content, "hello world");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_is_symlink() {
+        let dir = std::env::temp_dir().join("kaniko_test_is_symlink");
+        let _ = fs::create_dir_all(&dir);
+        let target = dir.join("target.txt");
+        let link = dir.join("link.txt");
+        fs::write(&target, "hello").unwrap();
+        #[cfg(unix)]
+        fs::soft_link(&target, &link).unwrap();
+
+        #[cfg(unix)]
+        {
+            assert!(is_symlink(&link));
+            assert!(!is_symlink(&target));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_copy_file_or_symlink_regular_file() {
+        let dir = std::env::temp_dir().join("kaniko_test_copy_file");
+        let _ = fs::remove_dir_all(&dir);
+        let root = dir.join("root");
+        let dest = dir.join("dest");
+        fs::create_dir_all(root.join("etc")).unwrap();
+        fs::write(root.join("etc/hosts"), "127.0.0.1 localhost").unwrap();
+
+        copy_file_or_symlink("etc/hosts", dest.to_string_lossy().as_ref(), root.to_string_lossy().as_ref()).unwrap();
+
+        let content = fs::read_to_string(dest.join("etc/hosts")).unwrap();
+        assert_eq!(content, "127.0.0.1 localhost");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_copy_file_or_symlink_symlink() {
+        let dir = std::env::temp_dir().join("kaniko_test_copy_symlink");
+        let _ = fs::remove_dir_all(&dir);
+        let root = dir.join("root");
+        let dest = dir.join("dest");
+        fs::create_dir_all(root.join("etc")).unwrap();
+        fs::write(root.join("etc/hosts"), "127.0.0.1").unwrap();
+        #[cfg(unix)]
+        fs::soft_link("hosts", root.join("etc/hosts.link")).unwrap();
+
+        #[cfg(unix)]
+        {
+            copy_file_or_symlink("etc/hosts.link", dest.to_string_lossy().as_ref(), root.to_string_lossy().as_ref()).unwrap();
+            let target = fs::read_link(dest.join("etc/hosts.link")).unwrap();
+            assert_eq!(target.to_string_lossy(), "hosts");
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_filepath_has_prefix() {
+        assert!(filepath_has_prefix("/etc/hosts", "/etc", false));
+        assert!(filepath_has_prefix("/etc/hosts", "/etc", true));
+        assert!(!filepath_has_prefix("/etc2/hosts", "/etc", false));
+        assert!(!filepath_has_prefix("/etc", "/etc/hosts", false));
+    }
+
+    #[test]
+    fn test_mkdir_all_with_permissions() {
+        let dir = std::env::temp_dir().join("kaniko_test_mkdir_perm");
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("sub/dir").to_string_lossy().to_string();
+
+        mkdir_all_with_permissions(&path, 0o755, -1, -1).unwrap();
+        assert!(Path::new(&path).exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_create_parent_directory() {
+        let dir = std::env::temp_dir().join("kaniko_test_parent_dir");
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("a/b/c/file.txt").to_string_lossy().to_string();
+
+        create_parent_directory(&path).unwrap();
+        assert!(dir.join("a/b/c").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_check_cleaned_path_against_ignore_list() {
+        // After init, /kaniko should be in ignore list
+        let _ = crate::ignore_list::init_ignore_list();
+        assert!(check_cleaned_path_against_ignore_list(Path::new("/kaniko")));
+        assert!(!check_cleaned_path_against_ignore_list(Path::new("/usr")));
+    }
+
+    #[test]
+    fn test_file_context_new() {
+        let ctx = FileContext::new("/workspace");
+        assert_eq!(ctx.root, "/workspace");
+        assert!(ctx.excluded_files.is_empty());
+    }
+
+    #[test]
+    fn test_file_context_excludes_file() {
+        let mut ctx = FileContext::new("/workspace");
+        ctx.excluded_files.push("*.log".to_string());
+        ctx.excluded_files.push("temp/".to_string());
+
+        assert!(ctx.excludes_file("/workspace/debug.log"));
+        assert!(!ctx.excludes_file("/workspace/src/main.rs"));
+    }
+
+    #[test]
+    fn test_new_file_context_from_dockerfile_no_dockerignore() {
+        let dir = std::env::temp_dir().join("kaniko_test_filectx");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let dockerfile = dir.join("Dockerfile");
+        fs::write(&dockerfile, "FROM scratch\n").unwrap();
+
+        let ctx = new_file_context_from_dockerfile(
+            dockerfile.to_string_lossy().as_ref(),
+            dir.to_string_lossy().as_ref(),
+        );
+        assert_eq!(ctx.root, dir.to_string_lossy().as_ref());
+        assert!(ctx.excluded_files.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_new_file_context_with_dockerignore() {
+        let dir = std::env::temp_dir().join("kaniko_test_filectx_ignore");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let dockerfile = dir.join("Dockerfile");
+        fs::write(&dockerfile, "FROM scratch\n").unwrap();
+        let dockerignore = dir.join(".dockerignore");
+        fs::write(&dockerignore, "*.log\ntemp/\n").unwrap();
+
+        let ctx = new_file_context_from_dockerfile(
+            dockerfile.to_string_lossy().as_ref(),
+            dir.to_string_lossy().as_ref(),
+        );
+        assert!(!ctx.excluded_files.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }

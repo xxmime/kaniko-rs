@@ -525,6 +525,140 @@ impl MultiStageBuilder {
         tracing::info!("Saved stage {} as tarball: {}", stage_index, tar_path.display());
         Ok(())
     }
+
+    /// Fetch extra stages that are referenced by COPY --from but are not
+    /// previous stages (i.e., they reference external images).
+    ///
+    /// For each such reference, pulls the image, saves it as a tarball,
+    /// and extracts it to a dependency directory so that COPY --from can
+    /// access its files.
+    ///
+    /// Analogous to Go: `executor.fetchExtraStages()` (build.go:908-952).
+    pub async fn fetch_extra_stages(&self) -> Result<()> {
+        let name_to_idx = self.resolve_cross_stage_instructions();
+        let mut known_names: Vec<String> = Vec::new();
+
+        for stage in &self.stages {
+            for instruction in &stage.instructions {
+                if let Instruction::Copy(copy_instr) = instruction {
+                    if let Some(ref from_stage) = copy_instr.from {
+                        // Skip if it's a previous stage index
+                        if let Ok(idx) = from_stage.parse::<usize>() {
+                            if idx < stage.index {
+                                continue;
+                            }
+                        }
+
+                        // Skip if it's a known previous stage name
+                        if known_names.iter().any(|n| n == from_stage) {
+                            continue;
+                        }
+
+                        // This must be an external image - fetch it
+                        tracing::info!("Found extra base image stage: {}", from_stage);
+
+                        // Pull the image from registry
+                        let auth = oci_registry::auth::RegistryAuth::anonymous(from_stage);
+                        let image = oci_registry::pull_image(from_stage, &auth)
+                            .await
+                            .map_err(|e| BuildError::OciImage(format!("Failed to pull image {}: {}", from_stage, e)))?;
+
+                        // Save as tarball
+                        let tar_path = self.root_dir.join("stage-tars").join(from_stage.replace('/', "_"));
+                        self.save_stage_as_tarball_from_image(&image, &tar_path)?;
+
+                        // Extract to dependency directory
+                        self.extract_image_to_dependency_dir(from_stage, &image)?;
+                    }
+                }
+            }
+
+            // Track stage name
+            if let Some(ref alias) = stage.alias {
+                known_names.push(alias.clone());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Save an image as a tarball.
+    ///
+    /// Writes the image layers and config to a tar file.
+    fn save_stage_as_tarball_from_image(
+        &self,
+        image: &MutableImage,
+        tar_path: &std::path::Path,
+    ) -> Result<()> {
+        if let Some(parent) = tar_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| BuildError::Io(e))?;
+        }
+
+        let file = std::fs::File::create(tar_path)
+            .map_err(|e| BuildError::Io(e))?;
+        let mut builder = tar::Builder::new(file);
+
+        // Write config
+        let config_json = serde_json::to_string_pretty(&image.config)
+            .map_err(|e| BuildError::OciImage(format!("Failed to serialize config: {}", e)))?;
+        let config_bytes = config_json.as_bytes();
+        let config_digest = <sha2::Sha256 as sha2::Digest>::digest(config_bytes);
+        let config_path = format!("blobs/sha256/{:x}", config_digest);
+
+        let mut config_header = tar::Header::new_gnu();
+        config_header.set_path(&config_path)
+            .map_err(|e| BuildError::Io(e))?;
+        config_header.set_size(config_bytes.len() as u64);
+        config_header.set_mode(0o644);
+        config_header.set_cksum();
+        builder.append(&config_header, config_bytes)
+            .map_err(|e| BuildError::Io(e))?;
+
+        // Write layers
+        for (i, layer) in image.layers.iter().enumerate() {
+            let layer_data = layer.uncompressed_data()
+                .map_err(|e| BuildError::OciImage(format!("Layer {} read error: {}", i, e)))?;
+            let layer_digest = <sha2::Sha256 as sha2::Digest>::digest(&layer_data);
+            let layer_path = format!("blobs/sha256/{:x}", layer_digest);
+
+            let mut layer_header = tar::Header::new_gnu();
+            layer_header.set_path(&layer_path)
+                .map_err(|e| BuildError::Io(e))?;
+            layer_header.set_size(layer_data.len() as u64);
+            layer_header.set_mode(0o644);
+            layer_header.set_cksum();
+            builder.append(&layer_header, layer_data.as_slice())
+                .map_err(|e| BuildError::Io(e))?;
+        }
+
+        builder.finish().map_err(|e| BuildError::Io(e))?;
+        tracing::info!("Saved image as tarball: {}", tar_path.display());
+        Ok(())
+    }
+
+    /// Extract an image's filesystem to a dependency directory.
+    ///
+    /// Creates a directory under the kaniko work dir named after the image,
+    /// and extracts all layers there so that COPY --from can access files.
+    ///
+    /// Analogous to Go: `executor.extractImageToDependencyDir()` (build.go:963-973).
+    fn extract_image_to_dependency_dir(
+        &self,
+        name: &str,
+        image: &MutableImage,
+    ) -> Result<()> {
+        let dep_dir = self.root_dir.join(name.replace('/', "_"));
+        std::fs::create_dir_all(&dep_dir)
+            .map_err(|e| BuildError::Io(e))?;
+
+        tracing::debug!("Extracting image {} to dependency dir: {}", name, dep_dir.display());
+
+        oci_image::extract::extract_image_to_fs(image, &dep_dir)
+            .map_err(|e| BuildError::OciImage(format!("Failed to extract image {}: {}", name, e)))?;
+
+        Ok(())
+    }
 }
     use super::*;
     use dockerfile_parser::parse_dockerfile;

@@ -1072,6 +1072,7 @@ dependencies = [
  "flate2",
  "glob",
  "hex",
+ "libc",
  "nix",
  "oci-image",
  "once_cell",

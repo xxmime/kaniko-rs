@@ -32,6 +32,10 @@ pub enum BuildError {
     CycleDetected(String),
     #[error("invalid stage reference: {0}")]
     InvalidStageReference(String),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("OCI image error: {0}")]
+    OciImage(String),
 }
 
 /// Result type for build operations.
