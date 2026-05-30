@@ -1000,6 +1000,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tar",
  "thiserror",
  "tokio",
  "tracing",

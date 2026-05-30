@@ -7,7 +7,7 @@
 //! - All Dockerfile instructions including ONBUILD, STOPSIGNAL, HEALTHCHECK, SHELL
 
 use crate::instruction::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 /// Errors that can occur during parsing.
@@ -33,6 +33,13 @@ pub struct Stage {
     pub alias: Option<String>,
     /// Instructions in this stage.
     pub instructions: Vec<Instruction>,
+    /// Whether this stage should be saved as a tarball for later use by other stages.
+    /// Analogous to Go: `KanikoStage.SaveStage`.
+    pub save_stage: bool,
+    /// Index of the base image stage (if the base refers to a previous stage via COPY --from).
+    /// -1 if the base image is not a previous stage.
+    /// Analogous to Go: `KanikoStage.BaseImageIndex`.
+    pub base_image_index: i32,
 }
 
 /// Variable substitution context - tracks ARG and ENV definitions
@@ -229,6 +236,8 @@ pub fn parse_dockerfile_with_build_args(
                     image,
                     alias,
                     instructions,
+                    save_stage: false,
+                    base_image_index: -1,
                 });
             }
             "ARG" => {
@@ -740,6 +749,71 @@ fn add_instruction(
             line: line_num,
             message: format!("Instruction {:?} must appear after FROM", instr),
         })
+    }
+}
+
+/// Convert parsed stages into KanikoStages by computing `save_stage` and `base_image_index`.
+///
+/// `save_stage` is true if any later stage references this stage by alias (COPY --from=alias).
+/// `base_image_index` is the index of the stage that provides the base image (if FROM refers
+/// to a previous stage), or -1 if the base is an external image.
+///
+/// Analogous to Go: `dockerfile.MakeKanikoStages()`.
+pub fn make_kaniko_stages(stages: &mut [Stage]) {
+    let num_stages = stages.len();
+    if num_stages == 0 {
+        return;
+    }
+
+    // Build alias → index map
+    let mut alias_to_index: HashMap<String, usize> = HashMap::new();
+    for (i, stage) in stages.iter().enumerate() {
+        if let Some(alias) = &stage.alias {
+            alias_to_index.insert(alias.clone(), i);
+        }
+    }
+
+    // Compute base_image_index for each stage
+    for i in 0..num_stages {
+        let image = &stages[i].image;
+        // Check if the image name matches an alias of a previous stage
+        let mut base_idx: i32 = -1;
+        if let Some(&idx) = alias_to_index.get(image) {
+            if idx < i {
+                base_idx = idx as i32;
+            }
+        }
+        // Also check numeric references (FROM 0, FROM 1)
+        if let Ok(idx) = image.parse::<usize>() {
+            if idx < i {
+                base_idx = idx as i32;
+            }
+        }
+        stages[i].base_image_index = base_idx;
+    }
+
+    // Compute save_stage: a stage should be saved if a later stage references it
+    // via COPY --from=<alias_or_index>
+    let mut save_stage_set: HashSet<usize> = HashSet::new();
+    for stage in stages.iter() {
+        for instr in &stage.instructions {
+            // Look for COPY/ADD instructions with --from flag
+            if let Instruction::Copy(copy) = instr {
+                if let Some(from) = &copy.from {
+                    // Try to resolve --from value to an index
+                    if let Ok(idx) = from.parse::<usize>() {
+                        save_stage_set.insert(idx);
+                    } else if let Some(&idx) = alias_to_index.get(from) {
+                        save_stage_set.insert(idx);
+                    }
+                }
+            }
+        }
+    }
+
+    // Set save_stage for each stage
+    for (i, stage) in stages.iter_mut().enumerate() {
+        stage.save_stage = save_stage_set.contains(&i);
     }
 }
 

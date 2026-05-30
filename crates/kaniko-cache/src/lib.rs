@@ -10,5 +10,5 @@ pub mod layout;
 pub mod push;
 
 pub use registry::RegistryCache;
-pub use layout::LayoutCache;
+pub use layout::{LayoutCache, locate_image, cached_image_from_path};
 pub use push::{cache_destination, push_layer_to_cache, PushCacheError};

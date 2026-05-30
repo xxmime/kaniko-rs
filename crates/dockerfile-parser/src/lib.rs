@@ -11,5 +11,5 @@ pub use instruction::Instruction;
 pub use parse::{
     parse_dockerfile, parse_dockerfile_with_build_args, VarContext, substitute_vars, Stage, ParseError,
     skip_unused_stages, build_stage_name_to_index, resolve_cross_stage_commands,
-    strip_enclosing_quotes, expand_nested_args,
+    strip_enclosing_quotes, expand_nested_args, make_kaniko_stages,
 };

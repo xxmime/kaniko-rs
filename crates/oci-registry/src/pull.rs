@@ -53,10 +53,29 @@ pub async fn pull_image(
     reference_str: &str,
     auth: &RegistryAuth,
 ) -> Result<MutableImage> {
+    pull_image_with_platform(reference_str, auth, None).await
+}
+
+/// Pull an image from a registry, with optional platform selection.
+///
+/// When a platform is specified (e.g., "linux/amd64") and the registry
+/// returns a manifest list, the appropriate platform-specific manifest
+/// is selected and used to pull the image.
+///
+/// Analogous to Go: `remote.Image(ref, remote.WithPlatform(platform))`.
+pub async fn pull_image_with_platform(
+    reference_str: &str,
+    auth: &RegistryAuth,
+    platform: Option<&str>,
+) -> Result<MutableImage> {
     // Check cache first
+    let cache_key = match platform {
+        Some(p) => format!("{}@{}", reference_str, p),
+        None => reference_str.to_string(),
+    };
     if let Ok(cache) = MANIFEST_CACHE.lock() {
-        if let Some(cached) = cache.get(reference_str) {
-            tracing::info!("Returning cached image manifest for {}", reference_str);
+        if let Some(cached) = cache.get(&cache_key) {
+            tracing::info!("Returning cached image manifest for {}", cache_key);
             return Ok(cached.clone());
         }
     }
@@ -64,7 +83,6 @@ pub async fn pull_image(
         .map_err(|e| PullError::Failed(e.to_string()))?;
     let base_url = reference.base_url(auth.insecure);
     let client = build_client(auth.insecure);
-    let _retry = RetryConfig::default();
 
     tracing::info!("Pulling image from {}", reference_str);
 
@@ -72,8 +90,10 @@ pub async fn pull_image(
     let token = authenticate_pull(&client, &base_url, &reference.repository, auth).await?;
     let auth_header = if token.is_empty() { String::new() } else { token };
 
-    // Step 2: Get manifest
-    let manifest = get_manifest(&client, &base_url, &reference.repository, &reference.tag, &auth_header).await?;
+    // Step 2: Get manifest (may be a manifest list)
+    let manifest = get_manifest_with_platform(
+        &client, &base_url, &reference.repository, &reference.tag, &auth_header, platform,
+    ).await?;
     tracing::info!("Got manifest with {} layers", manifest.layers.len());
 
     // Step 3: Get config blob
@@ -100,25 +120,41 @@ pub async fn pull_image(
 
     // Cache the pulled image for future use
     if let Ok(mut cache) = MANIFEST_CACHE.lock() {
-        cache.insert(reference_str.to_string(), image.clone());
+        cache.insert(cache_key, image.clone());
     }
 
     Ok(image)
 }
 
-/// Fetch the manifest for a tag/reference.
-async fn get_manifest(
+/// Fetch the manifest for a tag/reference, with platform selection.
+///
+/// If the returned content is a manifest list (index), selects the
+/// manifest matching the given platform (e.g., "linux/amd64").
+///
+/// Analogous to Go: `remote.Get(ref, WithPlatform(platform))`.
+async fn get_manifest_with_platform(
     client: &reqwest::Client,
     base_url: &str,
     repository: &str,
     tag: &str,
     auth_header: &str,
+    platform: Option<&str>,
 ) -> Result<Manifest> {
     let url = format!("{}/{}/manifests/{}", base_url, repository, tag);
+
+    // Accept both single manifests and manifest lists
+    let accept_header = format!(
+        "{}, {}, {}, {}",
+        MediaType::OCI_IMAGE_MANIFEST_V1,
+        MediaType::IMAGE_MANIFEST_V1S2,
+        MediaType::OCI_IMAGE_INDEX_V1,
+        MediaType::IMAGE_MANIFEST_LIST_V2S2,
+    );
+
     let resp = client
         .get(&url)
         .header("Authorization", auth_header)
-        .header("Accept", format!("{}, {}", MediaType::IMAGE_MANIFEST_V1S2, MediaType::OCI_IMAGE_MANIFEST_V1))
+        .header("Accept", &accept_header)
         .send()
         .await?;
 
@@ -128,8 +164,99 @@ async fn get_manifest(
         return Err(PullError::Failed(format!("manifest pull failed: HTTP {} - {}", status, body)));
     }
 
-    let manifest: Manifest = resp.json().await?;
-    Ok(manifest)
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let body = resp.bytes().await?;
+
+    // Check if this is a manifest list / index
+    if content_type.contains("manifest.list")
+        || content_type.contains("index.v1")
+        || content_type.contains("image.index")
+    {
+        // Parse as manifest index
+        let index: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| PullError::Failed(format!("failed to parse manifest index: {}", e)))?;
+
+        let manifests = index
+            .get("manifests")
+            .and_then(|m| m.as_array())
+            .ok_or_else(|| PullError::Failed("manifest index has no manifests array".to_string()))?;
+
+        // Parse target platform
+        let (target_os, target_arch) = match platform {
+            Some(p) => {
+                let parts: Vec<&str> = p.split('/').collect();
+                let os = parts.first().map(|s| *s).unwrap_or("linux");
+                let arch = parts.get(1).map(|s| *s).unwrap_or("amd64");
+                (os.to_string(), arch.to_string())
+            }
+            None => {
+                // Default to current platform
+                ("linux".to_string(), std::env::consts::ARCH.to_string())
+            }
+        };
+
+        tracing::info!("Selecting platform {}/{} from manifest list", target_os, target_arch);
+
+        // Find matching manifest descriptor
+        let mut selected_digest: Option<String> = None;
+        for m in manifests {
+            let platform_obj = m.get("platform");
+            if let Some(plat) = platform_obj {
+                let m_os = plat.get("os").and_then(|v| v.as_str()).unwrap_or("");
+                let m_arch = plat.get("architecture").and_then(|v| v.as_str()).unwrap_or("");
+                if m_os == target_os && m_arch == target_arch {
+                    selected_digest = m.get("digest").and_then(|d| d.as_str()).map(|s| s.to_string());
+                    break;
+                }
+            } else {
+                // No platform info — could be a non-list manifest, use digest directly
+                if selected_digest.is_none() {
+                    selected_digest = m.get("digest").and_then(|d| d.as_str()).map(|s| s.to_string());
+                }
+            }
+        }
+
+        let digest = selected_digest.ok_or_else(|| {
+            PullError::Failed(format!(
+                "no manifest found for platform {}/{}",
+                target_os, target_arch
+            ))
+        })?;
+
+        tracing::info!("Selected manifest digest: {}", digest);
+
+        // Fetch the specific manifest by digest
+        let url = format!("{}/{}/manifests/{}", base_url, repository, digest);
+        let resp = client
+            .get(&url)
+            .header("Authorization", auth_header)
+            .header("Accept", format!("{}, {}", MediaType::OCI_IMAGE_MANIFEST_V1, MediaType::IMAGE_MANIFEST_V1S2))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(PullError::Failed(format!(
+                "platform manifest pull failed: HTTP {} - {}",
+                status, body_text
+            )));
+        }
+
+        let manifest: Manifest = resp.json().await?;
+        Ok(manifest)
+    } else {
+        // Not a manifest list — parse as a single manifest
+        let manifest: Manifest = serde_json::from_slice(&body)
+            .map_err(|e| PullError::Failed(format!("failed to parse manifest: {}", e)))?;
+        Ok(manifest)
+    }
 }
 
 /// Fetch a blob by digest.

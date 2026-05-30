@@ -51,10 +51,33 @@ pub fn cache_destination(
         let dest = destinations
             .first()
             .ok_or_else(|| PushCacheError::Destination("no destinations specified".to_string()))?;
-        // Parse "registry/repository:tag" → "registry/repository:cache_key"
-        let (repo_part, _) = dest
-            .rsplit_once(':')
-            .unwrap_or((dest, "latest"));
+
+        // Parse destination to extract the registry/repository part (without tag).
+        // Must handle ports correctly: "localhost:5000/myimage:tag" → "localhost:5000/myimage"
+        //
+        // Strategy: look for the last ':' that comes after a '/' (i.e., after the path portion),
+        // which indicates a tag separator. A ':' before any '/' is part of the registry host:port.
+        //
+        // Analogous to Go: `name.NewTag(destination)` then `destRef.Context()`.
+        let repo_part = if let Some(slash_pos) = dest.rfind('/') {
+            // There's a '/' — split into host_port/path:tag
+            let after_slash = &dest[slash_pos + 1..];
+            if let Some(tag_pos) = after_slash.rfind(':') {
+                // Tag found after the last slash
+                &dest[..slash_pos + 1 + tag_pos]
+            } else {
+                // No tag after the last slash — use the whole string
+                dest
+            }
+        } else {
+            // No slash at all — e.g., "myimage:tag"
+            if let Some(tag_pos) = dest.rfind(':') {
+                &dest[..tag_pos]
+            } else {
+                dest
+            }
+        };
+
         Ok(format!("{}:{}", repo_part, cache_key))
     }
 }
@@ -186,5 +209,24 @@ mod tests {
         let destinations = vec!["localhost:5000/app:test".to_string()];
         let dest = cache_destination(&cache_repo, &destinations, "key").unwrap();
         assert_eq!(dest, "localhost:5000/cache:key");
+    }
+
+    #[test]
+    fn test_cache_destination_inferred_with_port() {
+        // Must correctly parse "localhost:5000/myimage:tag" → "localhost:5000/myimage"
+        // The port :5000 should NOT be confused with the tag separator
+        let cache_repo: Option<String> = None;
+        let destinations = vec!["localhost:5000/myimage:v1".to_string()];
+        let dest = cache_destination(&cache_repo, &destinations, "key123").unwrap();
+        assert_eq!(dest, "localhost:5000/myimage:key123");
+    }
+
+    #[test]
+    fn test_cache_destination_inferred_no_tag() {
+        // No tag → use full destination as repo part
+        let cache_repo: Option<String> = None;
+        let destinations = vec!["gcr.io/project/app".to_string()];
+        let dest = cache_destination(&cache_repo, &destinations, "key123").unwrap();
+        assert_eq!(dest, "gcr.io/project/app:key123");
     }
 }

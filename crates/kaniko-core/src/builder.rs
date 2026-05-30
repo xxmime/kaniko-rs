@@ -12,6 +12,7 @@ use oci_image::mutate::MutableImage;
 use oci_image::layer::Layer;
 use std::path::PathBuf;
 use thiserror::Error;
+use tokio::task::JoinSet;
 
 /// Errors during build operations.
 #[derive(Debug, Error)]
@@ -207,6 +208,10 @@ impl StageBuilder {
     pub async fn build(&mut self) -> Result<()> {
         tracing::info!("Building stage...");
 
+        // Cache group for parallel layer push.
+        // Analogous to Go: `cacheGroup := errgroup.Group{}`.
+        let mut cache_group: JoinSet<std::result::Result<(), String>> = JoinSet::new();
+
         // Resolve ONBUILD triggers from the base image.
         // When a Dockerfile uses `FROM base_image`, any ONBUILD triggers
         // registered in the base image must be prepended to the command list.
@@ -394,7 +399,8 @@ impl StageBuilder {
                         }
                     }
 
-                    // Try registry cache push (async, non-blocking)
+                    // Try registry cache push (async, with error aggregation).
+                    // Analogous to Go: `cacheGroup.Go(func() error { ... })`.
                     if self.cache_repo.is_some() || !self.destinations.is_empty() {
                         let cache_repo = self.cache_repo.clone();
                         let destinations = self.destinations.clone();
@@ -402,7 +408,7 @@ impl StageBuilder {
                         let no_push = self.no_push_cache;
                         let layer_for_cache = layer.clone();
 
-                        tokio::spawn(async move {
+                        cache_group.spawn(async move {
                             if let Err(e) = kaniko_cache::push::push_layer_to_cache(
                                 &cache_repo,
                                 &destinations,
@@ -413,7 +419,9 @@ impl StageBuilder {
                                 insecure,
                                 no_push,
                             ).await {
-                                tracing::warn!("Failed to push layer to cache: {}", e);
+                                Err(format!("Failed to push layer to cache: {}", e))
+                            } else {
+                                Ok(())
                             }
                         });
                     }
@@ -431,6 +439,20 @@ impl StageBuilder {
         if self.opts.single_snapshot {
             let layer = snapshotter.take_snapshot_fs()?;
             self.image = oci_image::mutate::append_layer(self.image.clone(), layer)?;
+        }
+
+        // Wait for all cache push tasks to complete.
+        // Analogous to Go: `if err := cacheGroup.Wait(); err != nil { logrus.Warnf(...) }`.
+        while let Some(result) = cache_group.join_next().await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!("Error uploading layer to cache: {}", e);
+                }
+                Err(e) => {
+                    tracing::warn!("Cache push task panicked: {}", e);
+                }
+            }
         }
 
         tracing::info!("Stage build complete with {} layers", self.image.layer_count());

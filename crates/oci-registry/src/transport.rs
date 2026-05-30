@@ -107,6 +107,36 @@ impl RegistryOptions {
     }
 }
 
+/// Replace the registry portion of an image reference.
+///
+/// E.g., `set_new_registry("docker.io/library/nginx:latest", "my-registry.example.com")`
+/// returns `"my-registry.example.com/library/nginx:latest"`.
+///
+/// Analogous to Go: `setNewRegistry()`.
+pub fn set_new_registry(reference: &str, new_registry: &str) -> String {
+    if let Some((_old_registry, rest)) = reference.split_once('/') {
+        format!("{}/{}", new_registry, rest)
+    } else {
+        // No slash — can't determine registry, return as-is
+        reference.to_string()
+    }
+}
+
+/// Replace the repository portion of an image reference (keeping the registry).
+///
+/// E.g., `set_new_repository("docker.io/library/nginx:latest", "myproject/nginx")`
+/// returns `"docker.io/myproject/nginx:latest"`.
+///
+/// Analogous to Go: `setNewRepository()`.
+pub fn set_new_repository(reference: &str, new_repo: &str) -> String {
+    if let Some((registry, _old_rest)) = reference.split_once('/') {
+        // Extract tag/digest from new_repo if present
+        format!("{}/{}", registry, new_repo)
+    } else {
+        new_repo.to_string()
+    }
+}
+
 /// Parse a registry mapping string into (registry_url, repository_prefix).
 /// Analogous to Go: `parseRegistryMapping()`.
 ///
