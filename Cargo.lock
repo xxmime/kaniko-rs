@@ -994,6 +994,7 @@ dependencies = [
 name = "kaniko-cache"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "oci-image",
  "oci-registry",
  "reqwest",

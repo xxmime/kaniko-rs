@@ -13,3 +13,4 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
+chrono = "0.4"

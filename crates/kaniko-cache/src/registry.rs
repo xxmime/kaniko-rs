@@ -23,6 +23,8 @@ pub enum RegistryCacheError {
     Http(#[from] reqwest::Error),
     #[error("cache miss for key: {0}")]
     Miss(String),
+    #[error("cache expired: {0}")]
+    Expired(String),
     #[error("registry error: {0}")]
     Registry(String),
     #[error("authentication error: {0}")]
@@ -55,6 +57,9 @@ pub struct RegistryCache {
     insecure: bool,
     /// Authentication token cache
     auth_tokens: HashMap<String, String>,
+    /// Cache TTL (time-to-live). Cached entries older than this are considered expired.
+    /// Analogous to Go: `config.KanikoOptions.CacheTTL`.
+    cache_ttl: std::time::Duration,
 }
 
 impl RegistryCache {
@@ -65,6 +70,18 @@ impl RegistryCache {
             client: reqwest::Client::new(),
             insecure,
             auth_tokens: HashMap::new(),
+            cache_ttl: std::time::Duration::from_secs(14 * 24 * 3600), // Default: 2 weeks
+        }
+    }
+
+    /// Create a new registry cache with a custom TTL.
+    pub fn with_ttl(cache_repo: &str, insecure: bool, cache_ttl: std::time::Duration) -> Self {
+        Self {
+            cache_repo: cache_repo.to_string(),
+            client: reqwest::Client::new(),
+            insecure,
+            auth_tokens: HashMap::new(),
+            cache_ttl,
         }
     }
 
@@ -230,12 +247,18 @@ impl RegistryCache {
             layers.push(layer);
         }
         
-        Ok(MutableImage {
+        let image = MutableImage {
             manifest,
             config,
             config_bytes: config_bytes.to_vec(),
             layers,
-        })
+        };
+
+        // Verify cache entry is not expired.
+        // Analogous to Go: `verifyImage(img, rc.Opts.CacheTTL, cache)`.
+        verify_image(&image, self.cache_ttl, key)?;
+
+        Ok(image)
     }
 
     /// Check if a cached layer exists for the given key.
@@ -405,6 +428,47 @@ pub struct CacheStats {
     pub cache_repo: String,
     /// Whether using insecure connections
     pub insecure: bool,
+}
+
+/// Verify that a cached image is not expired based on its creation time and TTL.
+///
+/// Checks the image config's `created` timestamp. If the creation time plus
+/// the TTL is before the current time, the cache entry is considered stale.
+///
+/// Analogous to Go: `cache.verifyImage(img, cacheTTL, cache string)`.
+fn verify_image(image: &MutableImage, cache_ttl: std::time::Duration, cache_key: &str) -> Result<()> {
+    // Try to get the created timestamp from the image config
+    let created_str = image.config.created.as_deref().unwrap_or("");
+
+    if created_str.is_empty() {
+        // No created timestamp — assume valid
+        tracing::debug!("No created timestamp for cache entry {}", cache_key);
+        return Ok(());
+    }
+
+    // Parse the RFC 3339 timestamp
+    let created = chrono::DateTime::parse_from_rfc3339(created_str)
+        .map_err(|e| RegistryCacheError::Registry(format!(
+            "Failed to parse created timestamp '{}' for cache {}: {}",
+            created_str, cache_key, e
+        )))?;
+
+    let expiry = created + cache_ttl;
+    let now = chrono::Utc::now();
+
+    if expiry < now {
+        tracing::info!("Cache entry expired: {}", cache_key);
+        return Err(RegistryCacheError::Expired(format!(
+            "Cache entry expired: {} (created {}, expired {})",
+            cache_key, created_str, expiry.to_rfc3339()
+        )));
+    }
+
+    // Force manifest population (analogous to Go: `img.RawManifest()`)
+    // The manifest is already available in the MutableImage struct.
+
+    tracing::debug!("Cache entry {} is valid (created {}, expires {})", cache_key, created_str, expiry.to_rfc3339());
+    Ok(())
 }
 
 #[cfg(test)]

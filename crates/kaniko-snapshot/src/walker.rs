@@ -1,7 +1,13 @@
 //! File system walker with .dockerignore support.
 //!
 //! Analogous to Go: `pkg/util/fs.FsWalker` + `.dockerignore` parsing.
+//!
+//! Key features:
+//! - `walk_for_snapshot()` — basic snapshot walk with .dockerignore + ignore list
+//! - `walk_fs()` — Go-compatible WalkFS with change detection and deletion tracking
+//! - `walk_with_ignore()` — walk respecting .dockerignore patterns
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -12,10 +18,106 @@ pub enum WalkerError {
     Io(#[from] std::io::Error),
     #[error("walk error: {0}")]
     Walk(#[from] walkdir::Error),
+    #[error("change detection error for {path}: {error}")]
+    ChangeDetection { path: PathBuf, error: String },
 }
 
 /// Result type for walker operations.
 pub type Result<T> = std::result::Result<T, WalkerError>;
+
+/// Result of a WalkFS scan: changed files and deleted paths.
+/// Analogous to Go: `walkFSResult`.
+pub struct WalkFsResult {
+    /// Files that were added or modified (passed the change function).
+    pub files_added: Vec<PathBuf>,
+    /// Files that were deleted (present in existing but not found during walk).
+    pub deleted_paths: HashSet<String>,
+}
+
+/// Walk the file system with change detection and deletion tracking.
+///
+/// This is the Go-compatible `WalkFS` implementation. It:
+/// 1. Walks the directory tree
+/// 2. For each file, calls the `change_func` to determine if it changed
+/// 3. Tracks which existing files were NOT found (they were deleted)
+///
+/// Analogous to Go: `util.WalkFS(dir, existingPaths, changeFunc)`.
+///
+/// # Arguments
+/// * `dir` — Root directory to walk
+/// * `existing_paths` — Set of paths from the previous snapshot (for deletion detection)
+/// * `change_func` — Callback that returns `true` if a file changed, `false` if unchanged
+///
+/// # Returns
+/// `WalkFsResult` with `files_added` (changed/new files) and `deleted_paths` (paths that no longer exist)
+pub fn walk_fs(
+    dir: &Path,
+    existing_paths: HashSet<String>,
+    change_func: impl Fn(&Path) -> std::result::Result<bool, String>,
+) -> Result<WalkFsResult> {
+    if !dir.exists() {
+        return Ok(WalkFsResult {
+            files_added: vec![],
+            deleted_paths: existing_paths,
+        });
+    }
+
+    let mut found_paths = Vec::new();
+    // Make a mutable copy for tracking deletions — each found file is removed.
+    let mut deleted_paths = existing_paths;
+
+    // Get ignore patterns for kaniko internal paths
+    let ignore_patterns = get_default_snapshot_ignores();
+
+    for entry in walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_entry(|e| {
+            // Skip ignored directories
+            if e.file_type().is_dir() {
+                !is_ignored(e.path(), &ignore_patterns, true)
+            } else {
+                true // Don't filter entries here; check below
+            }
+        })
+    {
+        let entry = entry?;
+        let path = entry.path();
+
+        // Skip the root directory itself
+        if path == dir {
+            continue;
+        }
+
+        // Skip ignored paths
+        let is_dir = entry.file_type().is_dir();
+        if is_ignored(path, &ignore_patterns, is_dir) {
+            continue;
+        }
+
+        // Convert to string key for set operations
+        let key = path.to_string_lossy().to_string();
+
+        // File exists on disk → remove from deleted set
+        // Analogous to Go: `delete(deletedFiles, path)`
+        deleted_paths.remove(&key);
+
+        // Check if this file changed using the change function
+        // Analogous to Go: `isChanged, err := changeFunc(path)`
+        let is_changed = change_func(path).map_err(|e| WalkerError::ChangeDetection {
+            path: path.to_path_buf(),
+            error: e,
+        })?;
+
+        if is_changed {
+            found_paths.push(path.to_path_buf());
+        }
+    }
+
+    Ok(WalkFsResult {
+        files_added: found_paths,
+        deleted_paths,
+    })
+}
 
 /// A parsed .dockerignore pattern.
 #[derive(Debug, Clone)]

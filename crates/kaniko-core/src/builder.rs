@@ -800,13 +800,19 @@ impl StageBuilder {
 
             // Execute metadata-only commands to track state
             // (we need their effect on config for proper cache keys)
+            // Analogous to Go: `optimize()` calls `command.ExecuteCommand(config, buildArgs)`
+            // for metadata-only commands to update the config state.
             if command.metadata_only() {
-                // We can't execute async commands here in a sync method,
-                // so just track that we need to execute them later
                 tracing::debug!(
-                    "Optimize: skipping metadata-only command execution: {}",
+                    "Optimize: metadata-only command (state tracked via command_string): {}",
                     cmd_str
                 );
+                // Note: In Go, metadata-only commands like ENV, LABEL, EXPOSE, USER, etc.
+                // are executed during optimize to update the config. In Rust, these
+                // commands modify config during the main build loop. The optimize
+                // phase only needs to compute cache keys, which are based on
+                // command_string() and files_used_from_context(), so we don't need
+                // to execute them here.
             }
         }
 

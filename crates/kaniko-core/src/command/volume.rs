@@ -1,9 +1,15 @@
 //! VOLUME command implementation.
+//!
+//! VOLUME creates mount points and marks them as holding externally mounted volumes.
+//! The directories are created if they don't exist.
+//!
+//! Analogous to Go: `pkg/commands/volume.go` — `VolumeCommand`.
 
 use crate::command::base::BaseCommand;
 use crate::command::{BuildArgs, Result};
 use async_trait::async_trait;
 use oci_image::config::ContainerConfig;
+use std::path::PathBuf;
 
 /// VOLUME instruction — creates mount points for volumes.
 #[derive(Debug)]
@@ -38,5 +44,19 @@ impl BaseCommand for VolumeCommand {
 
     fn command_string_impl(&self) -> String {
         format!("VOLUME {:?}", self.paths)
+    }
+
+    fn files_to_snapshot_impl(&self) -> Option<Vec<PathBuf>> {
+        // Return the volume paths as files to snapshot.
+        // Analogous to Go: VolumeCommand.FilesToSnapshot() returns volume paths.
+        if self.paths.is_empty() {
+            None
+        } else {
+            Some(self.paths.iter().map(|p| PathBuf::from(p)).collect())
+        }
+    }
+
+    fn provides_files_to_snapshot_impl(&self) -> bool {
+        true
     }
 }

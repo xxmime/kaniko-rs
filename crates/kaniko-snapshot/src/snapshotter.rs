@@ -8,7 +8,7 @@
 use crate::ignore_list::is_in_ignore_list;
 use crate::layered_map::LayeredMap;
 use crate::volumes;
-use crate::walker::{IgnorePattern, walk_for_snapshot, read_dockerignore, is_ignored};
+use crate::walker::{IgnorePattern, walk_for_snapshot, walk_fs, read_dockerignore, is_ignored};
 use oci_image::layer::Layer;
 use oci_image::whiteout::WhiteoutEntry;
 use std::path::{Path, PathBuf};
@@ -311,18 +311,50 @@ impl Snapshotter {
         Ok(files)
     }
 
-    /// Scan with diff detection (added + deleted files).
+    /// Scan with diff detection using WalkFS + CheckFileChange.
+    ///
+    /// This is the Go-compatible scan that:
+    /// 1. Walks the directory with WalkFS
+    /// 2. Uses `check_file_change` to detect which files actually changed (hash comparison)
+    /// 3. Tracks which files were deleted (present in previous but not on disk)
+    ///
+    /// Analogous to Go: `Snapshotter.scanFullFilesystem()`.
     fn scan_full_filesystem_with_diff(&self) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
-        let current_files = self.scan_full_filesystem()?;
-        let current_set: std::collections::HashSet<_> = current_files.iter().cloned().collect();
-        let previous_set: std::collections::HashSet<_> = self
-            .layered_map
-            .get_current_paths()
-            .into_iter()
-            .collect();
+        if !self.directory.exists() {
+            return Ok((vec![], vec![]));
+        }
 
-        let added: Vec<PathBuf> = current_set.difference(&previous_set).cloned().collect();
-        let deleted: Vec<PathBuf> = previous_set.difference(&current_set).cloned().collect();
+        // Get the existing paths from the layered map for deletion detection
+        let existing_paths = self.layered_map.get_current_paths_set();
+
+        // Create a clone of the layered map for the change function
+        // Note: We use interior mutability pattern via RefCell in the snapshotter
+        // For WalkFS, we need to pass a change_func. Since walk_fs requires a
+        // Fn(&Path) -> Result<bool, String>, we compute hashes inline.
+        let previous_map = self.layered_map.previous_hashes().clone();
+
+        let result = walk_fs(&self.directory, existing_paths, |path| {
+            // Analogous to Go: `s.l.CheckFileChange(path)`
+            // Compute hash and compare with previous
+            match compute_path_hash(path) {
+                Ok(new_hash) => {
+                    let key = path.to_string_lossy().to_string();
+                    let is_changed = match previous_map.get(&key) {
+                        Some(prev_hash) => new_hash != *prev_hash,
+                        None => true, // New file → changed
+                    };
+                    Ok(is_changed)
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        })?;
+
+        let added: Vec<PathBuf> = result.files_added;
+        let deleted: Vec<PathBuf> = result
+            .deleted_paths
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
 
         Ok((added, deleted))
     }
@@ -361,6 +393,29 @@ impl Snapshotter {
         let filtered = remove_obsolete_whiteouts(&deleted_set);
         Ok(filtered.iter().map(|p| WhiteoutEntry::regular(p)).collect())
     }
+}
+
+/// Compute a hash for a file path (used in WalkFS change detection).
+/// This is a standalone version of `compute_file_hash` from LayeredMap,
+/// needed because WalkFS's change_func closure cannot hold mutable refs.
+/// Analogous to Go: `LayeredMap.hasher(s string)`.
+fn compute_path_hash(path: &Path) -> std::io::Result<String> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        return Ok("dir".to_string());
+    }
+    if metadata.is_symlink() {
+        let target = std::fs::read_link(path)?;
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(target.to_string_lossy().as_bytes());
+        return Ok(format!("link:{}", hex::encode(hasher.finalize())));
+    }
+    let data = std::fs::read(path)?;
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(&data);
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Filter deleted files: only include a whiteout if its parent directory was NOT also deleted.
