@@ -10,7 +10,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Errors that can occur during layer operations.
@@ -119,6 +119,8 @@ impl Layer {
     /// Create a layer from a list of file paths.
     ///
     /// Builds a tar archive from the given files, then compresses it.
+    /// Handles parent directory inclusion, symlink target tracking, and
+    /// whiteout parent-path validation — analogous to Go's `writeToTar()`.
     pub fn from_files(
         files: &[impl AsRef<Path>],
         whiteouts: &[crate::whiteout::WhiteoutEntry],
@@ -127,15 +129,58 @@ impl Layer {
         let mut tar_data = Vec::new();
         {
             let mut builder = tar::Builder::new(&mut tar_data);
+            let mut added_paths: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+
+            // Expand file list with symlink targets (filesWithLinks).
+            // Analogous to Go: `filesWithLinks()` — for each symlink, also
+            // include its target if the target exists on disk.
+            let expanded_files = expand_files_with_links(files);
+
+            // Add whiteout entries first (analogous to Go: writeToTar whiteout loop).
+            // Skip whiteouts whose parent path has been replaced by a non-directory.
+            for whiteout in whiteouts {
+                let wh_path = whiteout.tar_path();
+                let abs_wh_path = root.join(&wh_path);
+
+                // Analogous to Go: `parentPathIncludesNonDirectory()`.
+                if parent_path_includes_non_directory(&abs_wh_path) {
+                    tracing::debug!(
+                        "Skipping whiteout {:?} — parent path includes non-directory",
+                        wh_path
+                    );
+                    continue;
+                }
+
+                // Add parent directories for whiteout entry
+                add_parent_directories(&mut builder, &mut added_paths, &abs_wh_path, root)?;
+
+                let mut header = tar::Header::new_gnu();
+                header.set_path(&wh_path)?;
+                header.set_size(0);
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_mode(0);
+                header.set_cksum();
+                builder.append(&header, std::io::empty())?;
+            }
 
             // Add regular files and directories
-            for file_path in files {
-                let path = file_path.as_ref();
+            for file_path in &expanded_files {
+                let path: &Path = file_path.as_ref();
                 if !path.exists() {
                     continue;
                 }
 
+                // Add parent directories first.
+                // Analogous to Go: `addParentDirectories()`.
+                add_parent_directories(&mut builder, &mut added_paths, path, root)?;
+
                 let rel_path = path.strip_prefix(root).unwrap_or(path);
+
+                // Skip if already added
+                if added_paths.contains(path) {
+                    continue;
+                }
+
                 let metadata = std::fs::symlink_metadata(path)?;
 
                 if metadata.is_file() {
@@ -179,18 +224,8 @@ impl Layer {
                     header.set_cksum();
                     builder.append(&header, std::io::empty())?;
                 }
-            }
 
-            // Add whiteout entries
-            for whiteout in whiteouts {
-                let wh_path = whiteout.tar_path();
-                let mut header = tar::Header::new_gnu();
-                header.set_path(&wh_path)?;
-                header.set_size(0);
-                header.set_entry_type(tar::EntryType::Regular);
-                header.set_mode(0);
-                header.set_cksum();
-                builder.append(&header, std::io::empty())?;
+                added_paths.insert(path.to_path_buf());
             }
 
             builder.finish()?;
@@ -375,6 +410,137 @@ impl LayerCompression {
             level: level as i32,
         }
     }
+}
+
+/// Expand file list with symlink target paths.
+///
+/// For each file path that is a symlink, if the target exists on disk,
+/// also include the target path in the returned list.
+///
+/// Analogous to Go: `filesWithLinks()`.
+fn expand_files_with_links(files: &[impl AsRef<Path>]) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    for file_path in files {
+        let path = file_path.as_ref();
+        result.push(path.to_path_buf());
+
+        // If this is a symlink, also include its target
+        if path.is_symlink() {
+            if let Ok(target) = std::fs::read_link(path) {
+                // Resolve relative symlink targets against the symlink's parent directory
+                let resolved_target = if target.is_absolute() {
+                    target
+                } else {
+                    match path.parent() {
+                        Some(parent) => parent.join(&target),
+                        None => target,
+                    }
+                };
+
+                // Only add target if it exists on disk
+                if resolved_target.exists() {
+                    result.push(resolved_target);
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Add parent directories for a given path to the tar builder.
+///
+/// Ensures that all ancestor directories of the given path are present
+/// in the tar archive. Skips directories that have already been added.
+///
+/// Analogous to Go: `addParentDirectories()`.
+fn add_parent_directories<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
+    added_paths: &mut std::collections::HashSet<PathBuf>,
+    path: &Path,
+    root: &Path,
+) -> Result<()> {
+    // Collect parent directories from root to the immediate parent of `path`
+    let mut parents = Vec::new();
+    let mut current = path;
+    while let Some(parent) = current.parent() {
+        if parent == root || parent.as_os_str().is_empty() {
+            break;
+        }
+        parents.push(parent.to_path_buf());
+        current = parent;
+    }
+    // Reverse so we add from root outward
+    parents.reverse();
+
+    for parent in parents {
+        if added_paths.contains(&parent) {
+            continue;
+        }
+        if !parent.exists() {
+            continue;
+        }
+
+        let rel_path = parent.strip_prefix(root).unwrap_or(&parent);
+        let metadata = std::fs::symlink_metadata(&parent)?;
+
+        if metadata.is_dir() {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(rel_path)?;
+            header.set_size(0);
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_mode(metadata.permissions().mode());
+            let mtime = metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            header.set_mtime(mtime);
+            header.set_cksum();
+            builder.append(&header, std::io::empty())?;
+            added_paths.insert(parent);
+        } else if metadata.is_symlink() {
+            let target = std::fs::read_link(&parent)?;
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_path(rel_path)?;
+            header.set_link_name(&target)?;
+            header.set_size(0);
+            header.set_cksum();
+            builder.append(&header, std::io::empty())?;
+            added_paths.insert(parent);
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if any parent of the given path has been replaced with a non-directory.
+///
+/// This is used to skip whiteout entries whose parent directory has been
+/// replaced by a file or symlink — the whiteout would be redundant.
+///
+/// Analogous to Go: `parentPathIncludesNonDirectory()`.
+fn parent_path_includes_non_directory(path: &Path) -> bool {
+    let mut current = path;
+    while let Some(parent) = current.parent() {
+        if parent.as_os_str().is_empty() {
+            break;
+        }
+        match std::fs::symlink_metadata(parent) {
+            Ok(metadata) => {
+                if !metadata.is_dir() {
+                    return true;
+                }
+            }
+            Err(_) => {
+                // If we can't stat the parent, it doesn't exist — not a non-directory
+                return false;
+            }
+        }
+        current = parent;
+    }
+    false
 }
 
 #[cfg(test)]

@@ -448,6 +448,95 @@ pub fn resolve_env_and_wildcards(
     Ok((resolved_sources, resolved_dest))
 }
 
+/// User information returned by `lookup_user`.
+///
+/// Analogous to Go: `user.User`.
+#[derive(Debug, Clone)]
+pub struct UserInfo {
+    /// User ID.
+    pub uid: u32,
+    /// Group ID.
+    pub gid: u32,
+    /// Username.
+    pub name: String,
+    /// Home directory.
+    pub home_dir: String,
+}
+
+/// Look up a user by name or numeric ID string.
+///
+/// Tries in order:
+/// 1. Look up by username in `/etc/passwd`
+/// 2. Look up by numeric UID in `/etc/passwd`
+/// 3. Parse as numeric UID and create a minimal UserInfo
+///
+/// Analogous to Go: `LookupUser()`.
+pub fn lookup_user(user_str: &str) -> Result<UserInfo, String> {
+    // Step 1: Try looking up by username
+    if let Some(info) = lookup_user_by_name(user_str) {
+        return Ok(info);
+    }
+
+    // Step 2: Try looking up by UID
+    if let Some(info) = lookup_user_by_uid(user_str) {
+        return Ok(info);
+    }
+
+    // Step 3: Try parsing as numeric UID
+    if let Ok(uid) = user_str.parse::<u32>() {
+        return Ok(UserInfo {
+            uid,
+            gid: 0,
+            name: user_str.to_string(),
+            home_dir: "/".to_string(),
+        });
+    }
+
+    Err(format!(
+        "user {} is not a uid and does not exist on the system",
+        user_str
+    ))
+}
+
+/// Look up a user by username in /etc/passwd.
+fn lookup_user_by_name(name: &str) -> Option<UserInfo> {
+    let passwd = fs::read_to_string("/etc/passwd").ok()?;
+    for line in passwd.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() >= 7 && fields[0] == name {
+            return Some(UserInfo {
+                uid: fields[2].parse().ok()?,
+                gid: fields[3].parse().ok()?,
+                name: fields[0].to_string(),
+                home_dir: fields[5].to_string(),
+            });
+        }
+    }
+    None
+}
+
+/// Look up a user by UID string in /etc/passwd.
+fn lookup_user_by_uid(uid_str: &str) -> Option<UserInfo> {
+    let uid: u32 = uid_str.parse().ok()?;
+    let passwd = fs::read_to_string("/etc/passwd").ok()?;
+    for line in passwd.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() >= 7 {
+            if let Ok(field_uid) = fields[2].parse::<u32>() {
+                if field_uid == uid {
+                    return Some(UserInfo {
+                        uid: field_uid,
+                        gid: fields[3].parse().unwrap_or(0),
+                        name: fields[0].to_string(),
+                        home_dir: fields[5].to_string(),
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -342,6 +342,13 @@ async fn do_build(
     let last_stage_idx = stages.len() - 1;
     let mut built_images: HashMap<usize, MutableImage> = HashMap::new();
 
+    // Track stage digest → cache key and stage idx → digest mappings.
+    // Analogous to Go: `digestToCacheKey` and `stageIdxToDigest`.
+    // These are used for multi-stage build cache sharing — when a later stage
+    // references a previous stage by index, we can look up its digest and cache key.
+    let mut digest_to_cache_key: HashMap<String, String> = HashMap::new();
+    let mut stage_idx_to_digest: HashMap<String, String> = HashMap::new();
+
     // Build options — shared across all stages
     let build_opts = BuildOptions {
         cache: cli.cache,
@@ -443,6 +450,23 @@ async fn do_build(
         }
 
         built_images.insert(stage_idx, image);
+
+        // Record stage digest → cache key and stage idx → digest mappings.
+        // Analogous to Go: `d, err := sourceImage.Digest()` then
+        //   `stageIdxToDigest[fmt.Sprintf("%d", sb.stage.Index)] = d.String()`
+        //   `digestToCacheKey[d.String()] = sb.finalCacheKey`
+        let stage_image = built_images.get(&stage_idx).unwrap();
+        let digest = stage_image.digest();
+        let digest_str = digest.to_string();
+        stage_idx_to_digest.insert(format!("{}", stage_idx), digest_str.clone());
+        tracing::debug!("Mapping stage idx {} to digest {}", stage_idx, digest_str);
+
+        // Note: cache_key mapping would come from the builder's composite_key.hash()
+        // For now we record an empty placeholder since the CLI path doesn't use
+        // StageBuilder (which computes the composite key). This mapping will be
+        // fully populated when StageBuilder is used for the build loop.
+        digest_to_cache_key.insert(digest_str.clone(), String::new());
+        tracing::debug!("Mapping digest {} to cachekey (placeholder)", digest_str);
 
         // Only return the last stage (or target stage)
         if stage_idx == last_stage_idx || target_stage.is_some() {
