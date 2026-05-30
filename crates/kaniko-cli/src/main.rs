@@ -48,7 +48,7 @@ async fn main() {
     }
 
     // Configure logging based on CLI args
-    init_logging(&cli.log_level, &cli.log_format);
+    init_logging(&cli.log_level, &cli.log_format, cli.log_timestamp);
 
     tracing::info!("kaniko-rs executor starting");
 
@@ -78,7 +78,8 @@ async fn main() {
 }
 
 /// Initialize the tracing/logging subscriber based on CLI flags.
-fn init_logging(level: &str, format: &str) {
+/// Analogous to Go: `logging.Configure(level, format, logTimestamp)`.
+fn init_logging(level: &str, format: &str, log_timestamp: bool) {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(level));
@@ -87,15 +88,18 @@ fn init_logging(level: &str, format: &str) {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .json()
+            .with_target(log_timestamp)
             .init();
     } else if format == "color" {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_ansi(true)
+            .with_target(log_timestamp)
             .init();
     } else {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
+            .with_target(log_timestamp)
             .init();
     }
 }
@@ -103,8 +107,16 @@ fn init_logging(level: &str, format: &str) {
 /// Main build execution flow.
 /// Analogous to Go: `cmd/executor/cmd/root.go` → Run command handler.
 async fn run(mut cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // ===== Apply environment variable overrides =====
+    // Analogous to Go: `validateFlags()` — KANIKO_REGISTRY_MIRROR, KANIKO_NO_PUSH, KANIKO_REGISTRY_MAP
+    cli = apply_env_overrides(cli);
+
     // ===== Validate flags =====
     validate_flags(&cli)?;
+
+    // ===== Check if running in container =====
+    // Analogous to Go: `checkContained()` — warns if outside container without --force
+    check_contained(cli.force);
 
     // ===== Set dummy destinations if --no-push and --tar-path =====
     // Analogous to Go: `push.setDummyDestinations()`.
@@ -188,6 +200,92 @@ fn validate_flags(cli: &Cli) -> Result<(), Box<dyn std::error::Error + Send + Sy
         return Err("cache requires --cache-repo or at least one --destination".into());
     }
     Ok(())
+}
+
+/// Apply environment variable overrides to CLI flags.
+///
+/// Analogous to Go: `validateFlags()` in root.go, which reads:
+/// - `KANIKO_REGISTRY_MIRROR` → appends to registry-maps (index.docker.io=mirror)
+/// - `KANIKO_NO_PUSH` → overrides --no-push
+/// - `KANIKO_REGISTRY_MAP` → appends to registry-maps
+///
+/// Returns a modified Cli with env overrides applied.
+fn apply_env_overrides(mut cli: Cli) -> Cli {
+    // KANIKO_REGISTRY_MIRROR: each value maps index.docker.io → mirror
+    // Go: `for _, target := range opts.RegistryMirrors { opts.RegistryMaps.Set(...) }`
+    if let Ok(val) = std::env::var("KANIKO_REGISTRY_MIRROR") {
+        for mirror in val.split(',') {
+            let mirror = mirror.trim();
+            if !mirror.is_empty() {
+                let map_entry = format!("index.docker.io={}", mirror);
+                if !cli.registry_map.contains(&map_entry) {
+                    tracing::debug!("KANIKO_REGISTRY_MIRROR: added registry map {}", map_entry);
+                    cli.registry_map.push(map_entry);
+                }
+            }
+        }
+    }
+
+    // KANIKO_NO_PUSH: boolean override for --no-push
+    if let Ok(val) = std::env::var("KANIKO_NO_PUSH") {
+        match val.to_lowercase().as_str() {
+            "true" | "1" | "yes" => {
+                if !cli.no_push {
+                    tracing::debug!("KANIKO_NO_PUSH=true: overriding --no-push");
+                    cli.no_push = true;
+                }
+            }
+            "false" | "0" | "no" => {
+                if cli.no_push {
+                    tracing::debug!("KANIKO_NO_PUSH=false: overriding --no-push");
+                    cli.no_push = false;
+                }
+            }
+            _ => {
+                tracing::warn!("Invalid value for KANIKO_NO_PUSH env var (expected true/false): {}", val);
+            }
+        }
+    }
+
+    // KANIKO_REGISTRY_MAP: same format as --registry-map
+    if let Ok(val) = std::env::var("KANIKO_REGISTRY_MAP") {
+        for map_entry in val.split(',') {
+            let map_entry = map_entry.trim();
+            if !map_entry.is_empty() && !cli.registry_map.contains(&map_entry.to_string()) {
+                cli.registry_map.push(map_entry.to_string());
+                tracing::debug!("KANIKO_REGISTRY_MAP: added {}", map_entry);
+            }
+        }
+    }
+
+    // KANIKO_DIR: override kaniko directory
+    // Go: `dir := config.KanikoDir; if opts.KanikoDir != constants.DefaultKanikoPath { dir = opts.KanikoDir }`
+    if let Ok(val) = std::env::var("KANIKO_DIR") {
+        if cli.kaniko_dir == "/kaniko" && !val.is_empty() {
+            cli.kaniko_dir = val;
+            tracing::debug!("KANIKO_DIR: overriding kaniko directory to {}", cli.kaniko_dir);
+        }
+    }
+
+    cli
+}
+
+/// Check if kaniko is running inside a container.
+/// If not, warn the user (or exit if --force is not set).
+///
+/// Analogous to Go: `checkContained()` in root.go.
+fn check_contained(force: bool) {
+    use kaniko_snapshot::container::is_running_in_container;
+    if !is_running_in_container() {
+        if !force {
+            tracing::error!(
+                "kaniko should only be run inside of a container, \
+                 run with the --force flag if you are sure you want to continue"
+            );
+            std::process::exit(1);
+        }
+        tracing::warn!("Kaniko is being run outside of a container. This can have dangerous effects on your system");
+    }
 }
 
 /// Build all stages and return the final image.
