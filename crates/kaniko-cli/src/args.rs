@@ -36,7 +36,7 @@ pub struct Cli {
     // ===== Core build options =====
 
     /// Path to the Dockerfile.
-    #[arg(short, long, default_value = "Dockerfile")]
+    #[arg(short = 'f', long, default_value = "Dockerfile")]
     pub dockerfile: Option<String>,
 
     /// Path to the build context directory.
@@ -48,7 +48,7 @@ pub struct Cli {
     pub context_sub_path: Option<String>,
 
     /// Image destination(s) to push to.
-    #[arg(short, long)]
+    #[arg(short = 'd', long)]
     pub destination: Vec<String>,
 
     // ===== Cache options =====
