@@ -1,0 +1,31 @@
+# 使用 Ubuntu 作为基础镜像来构建 Linux 版本
+FROM ubuntu:22.04
+
+# 安装必要的依赖
+RUN apt-get update && apt-get install -y \
+    curl \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    ca-certificates
+
+# 安装 Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# 设置工作目录
+WORKDIR /app
+
+# 复制项目文件
+COPY . .
+
+# 构建 Linux 版本
+RUN cargo build --release
+
+# 提取二进制文件
+RUN cp target/release/kaniko-cli /kaniko-cli-linux-amd64
+
+# 最终阶段 - 只包含二进制文件
+FROM scratch
+COPY --from=0 /kaniko-cli-linux-amd64 /kaniko-cli
+ENTRYPOINT ["/kaniko-cli"]

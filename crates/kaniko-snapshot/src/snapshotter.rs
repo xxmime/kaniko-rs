@@ -123,6 +123,8 @@ pub enum SnapshotError {
     Layer(#[from] oci_image::layer::LayerError),
     #[error("layered map error: {0}")]
     LayeredMap(#[from] crate::layered_map::LayeredMapError),
+    #[error("nix error: {0}")]
+    Nix(#[from] nix::errno::Errno),
 }
 
 /// Result type for snapshotter operations.
@@ -248,14 +250,14 @@ impl Snapshotter {
         #[cfg(target_os = "linux")]
         {
             use std::fs::File;
-            use std::os::unix::io::AsRawFd;
+            use std::os::unix::io::AsFd;
             use nix::unistd::syncfs;
             
             // Open the root directory of the file system we want to sync
             let root_file = File::open(&self.directory)?;
             
             // Call syncfs syscall to sync the entire file system
-            syncfs(root_file.as_raw_fd())?;
+            syncfs(&root_file)?;
             
             tracing::debug!("Filesystem synced successfully");
         }

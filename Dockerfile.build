@@ -1,0 +1,15 @@
+FROM rust:1.85
+
+WORKDIR /app
+
+# 复制项目文件
+COPY . .
+
+# 安装依赖并构建
+RUN cargo build --release --target x86_64-unknown-linux-gnu
+
+# 提取二进制文件
+FROM scratch
+COPY --from=0 /app/target/x86_64-unknown-linux-gnu/release/kaniko-cli /kaniko-cli
+
+ENTRYPOINT ["/kaniko-cli"]
