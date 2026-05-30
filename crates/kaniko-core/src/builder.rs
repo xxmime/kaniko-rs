@@ -484,23 +484,22 @@ impl StageBuilder {
 
             tracing::info!("Resolving {} ONBUILD trigger(s) from base image", onbuild_triggers.len());
 
-            // Parse each ONBUILD trigger string into a DockerCommand
-            // and prepend them to the command list.
-            // ONBUILD triggers are strings like "RUN pip install -r requirements.txt"
-            let mut trigger_commands: Vec<Box<dyn DockerCommand>> = Vec::new();
-            for trigger in onbuild_triggers {
-                if let Some(cmd) = parse_trigger_to_command(trigger) {
-                    tracing::info!("  ONBUILD trigger: {}", trigger);
-                    trigger_commands.push(cmd);
-                } else {
-                    tracing::warn!("  Could not parse ONBUILD trigger: {}", trigger);
+            // Parse all ONBUILD triggers using the full parser
+            match parse_trigger_to_command(onbuild_triggers) {
+                Ok(trigger_commands) => {
+                    if !trigger_commands.is_empty() {
+                        tracing::info!("Successfully parsed {} ONBUILD commands", trigger_commands.len());
+                        
+                        // Prepend triggers before existing commands
+                        let mut new_commands = trigger_commands;
+                        new_commands.append(&mut self.commands);
+                        self.commands = new_commands;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to parse ONBUILD triggers: {}", e);
                 }
             }
-
-            // Prepend triggers before existing commands
-            let mut new_commands = trigger_commands;
-            new_commands.append(&mut self.commands);
-            self.commands = new_commands;
 
             // Clear the on_build field so triggers don't propagate further
             self.image.config.config.on_build = None;
@@ -846,113 +845,14 @@ impl StageBuilder {
     }
 }
 
-/// Parse an ONBUILD trigger string into a DockerCommand.
-///
-/// ONBUILD triggers are stored as strings like "RUN pip install -r requirements.txt"
-/// or "COPY . /app". This function parses them back into executable commands.
-fn parse_trigger_to_command(trigger: &str) -> Option<Box<dyn DockerCommand>> {
-    let trigger = trigger.trim();
-    let (directive, rest) = trigger.split_once(' ')?;
-    let directive = directive.to_uppercase();
-
-    match directive.as_str() {
-        "RUN" => {
-            let cmd = crate::command::RunCommand::new_shell(rest.to_string(), false);
-            Some(Box::new(cmd))
-        }
-        "COPY" => {
-            let cmd = crate::command::CopyCommand::new(
-                rest.split_whitespace().map(String::from).collect(),
-                String::new(), // Will be set properly during execution
-                None,
-                std::path::PathBuf::from("."),
-                false,
-            );
-            Some(Box::new(cmd))
-        }
-        "ADD" => {
-            let cmd = crate::command::AddCommand::new(
-                rest.split_whitespace().map(String::from).collect(),
-                String::new(),
-                std::path::PathBuf::from("."),
-                false,
-            );
-            Some(Box::new(cmd))
-        }
-        "ENV" => {
-            if let Some((key, value)) = rest.split_once('=') {
-                let cmd = crate::command::EnvCommand::new(key.to_string(), value.to_string());
-                Some(Box::new(cmd))
-            } else if let Some((key, value)) = rest.split_once(' ') {
-                let cmd = crate::command::EnvCommand::new(key.to_string(), value.to_string());
-                Some(Box::new(cmd))
-            } else {
-                None
-            }
-        }
-        "LABEL" => {
-            // Simplified: treat the rest as a single label
-            if let Some((key, value)) = rest.split_once('=') {
-                let cmd = crate::command::LabelCommand::new(vec![(key.to_string(), value.to_string())]);
-                Some(Box::new(cmd))
-            } else {
-                None
-            }
-        }
-        "WORKDIR" => {
-            let cmd = crate::command::WorkdirCommand::new(rest.to_string());
-            Some(Box::new(cmd))
-        }
-        "USER" => {
-            let cmd = crate::command::UserCommand::new(rest.to_string());
-            Some(Box::new(cmd))
-        }
-        "EXPOSE" => {
-            let ports = rest.split_whitespace().map(String::from).collect();
-            let cmd = crate::command::ExposeCommand::new(ports);
-            Some(Box::new(cmd))
-        }
-        "VOLUME" => {
-            let paths = rest.split_whitespace().map(String::from).collect();
-            let cmd = crate::command::VolumeCommand::new(paths);
-            Some(Box::new(cmd))
-        }
-        "ARG" => {
-            let (name, default) = if let Some((n, v)) = rest.split_once('=') {
-                (n.to_string(), Some(v.to_string()))
-            } else {
-                (rest.to_string(), None)
-            };
-            let cmd = crate::command::ArgCommand::new(name, default);
-            Some(Box::new(cmd))
-        }
-        "CMD" => {
-            let cmd = crate::command::CmdCommand::new_shell(rest.to_string());
-            Some(Box::new(cmd))
-        }
-        "ENTRYPOINT" => {
-            let cmd = crate::command::EntrypointCommand::new_shell(rest.to_string());
-            Some(Box::new(cmd))
-        }
-        "SHELL" => {
-            let shell = rest.split_whitespace().map(String::from).collect();
-            let cmd = crate::command::ShellCommand::new(shell);
-            Some(Box::new(cmd))
-        }
-        "STOPSIGNAL" => {
-            let cmd = crate::command::StopSignalCommand::new(rest.to_string());
-            Some(Box::new(cmd))
-        }
-        "ONBUILD" => {
-            // Nested ONBUILD is not allowed by Docker
-            tracing::warn!("Nested ONBUILD is not allowed, skipping: {}", trigger);
-            None
-        }
-        _ => {
-            tracing::warn!("Unknown ONBUILD directive: {}", directive);
-            None
-        }
-    }
+/// Parse ONBUILD triggers using the full dockerfile parser
+/// This replaces the simple string-based parser with a complete parser
+/// that matches Go's ParseCommands functionality
+fn parse_trigger_to_command(triggers: &[String]) -> Result<Vec<Box<dyn DockerCommand>>> {
+    use crate::onbuild_parser::parse_onbuild_triggers;
+    
+    parse_onbuild_triggers(triggers)
+        .map_err(|e| BuildError::Command(crate::command::CommandError::Failed(e.to_string())))
 }
 
 /// A cached command that provides pre-computed layers instead of executing.

@@ -8,7 +8,9 @@ pub mod builder;
 pub mod command;
 pub mod composite_key;
 pub mod config;
+pub mod container_runtime;
 pub mod multistage_builder;
+pub mod onbuild_parser;
 
 pub use builder::{BuildOptions, BuildError, Result};
 pub use composite_key::CompositeCache;

@@ -42,6 +42,49 @@ impl BuildArgs {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Resolve environment variables with ARG replacements
+    pub fn replacement_envs(&self, env_vars: &[String]) -> Vec<String> {
+        let mut result = Vec::new();
+        
+        for env_var in env_vars {
+            if let Some(pos) = env_var.find('=') {
+                let key = &env_var[..pos];
+                let value = &env_var[pos + 1..];
+                // Resolve ARG replacements in the value
+                let resolved_value = self.resolve_arg_replacements(value);
+                result.push(format!("{}={}", key, resolved_value));
+            }
+        }
+        
+        result
+    }
+
+    /// Resolve ARG replacements in a string
+    fn resolve_arg_replacements(&self, value: &str) -> String {
+        let mut result = value.to_string();
+        
+        // Simple ARG replacement: ${VAR} and $VAR
+        for (arg_name, arg_value) in &self.args {
+            let arg_val = arg_value.as_deref().unwrap_or("");
+            
+            // Replace ${VAR}
+            result = result.replace(&format!("${{{}}}", arg_name), arg_val);
+            // Replace $VAR (but not $VAR_ or $VAR_SUFFIX)
+            let pattern = format!("${}", arg_name);
+            result = result.replace(&pattern, arg_val);
+        }
+        
+        // Also check build_args (CLI overrides)
+        for (arg_name, arg_value) in &self.build_args {
+            let pattern1 = format!("${{{}}}", arg_name);
+            let pattern2 = format!("${}", arg_name);
+            result = result.replace(&pattern1, arg_value);
+            result = result.replace(&pattern2, arg_value);
+        }
+        
+        result
+    }
 }
 
 /// Dockerfile command execution trait.
