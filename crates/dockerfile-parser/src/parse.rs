@@ -1194,3 +1194,359 @@ mod tests_run_flags {
         assert_eq!(cmd, "make build");
     }
 }
+
+// ============================================================================
+// Stage analysis utilities
+// ============================================================================
+
+/// Skip unused stages in a multi-stage Dockerfile build.
+///
+/// Given a list of stages and a target stage, returns only the stages
+/// that are actually needed to build the target. This is done by
+/// walking backwards from the target and tracking COPY --from dependencies.
+///
+/// Analogous to Go: `pkg/dockerfile.skipUnusedStages()`.
+pub fn skip_unused_stages(
+    stages: &[Stage],
+    target_index: usize,
+) -> Vec<Stage> {
+    let mut dependencies = std::collections::HashSet::<String>::new();
+    let last_stage_base = stages[target_index].image.to_lowercase();
+
+    // Walk backwards from the target stage
+    for i in (0..=target_index).rev() {
+        let s = &stages[i];
+        let is_dep = (s.alias.as_ref().map(|a| a.to_lowercase()).as_ref() == Some(&last_stage_base))
+            || dependencies.contains(&s.alias.as_ref().map(|a| a.to_lowercase()).unwrap_or_default())
+            || i == target_index;
+
+        if is_dep {
+            // Check COPY --from instructions for dependencies on other stages
+            for instruction in &s.instructions {
+                if let Instruction::Copy(copy) = instruction {
+                    if let Some(ref from) = copy.from {
+                        // If it's a numeric index, resolve to the stage name
+                        let stage_name = if let Ok(idx) = from.parse::<usize>() {
+                            stages.get(idx)
+                                .and_then(|st| st.alias.as_ref())
+                                .map(|a| a.to_lowercase())
+                                .unwrap_or_default()
+                        } else {
+                            from.to_lowercase()
+                        };
+                        if !stage_name.is_empty() {
+                            dependencies.insert(stage_name);
+                        }
+                    }
+                }
+            }
+
+            // The base image of a dependent stage is also a dependency
+            if i != target_index {
+                dependencies.insert(s.image.to_lowercase());
+            }
+        }
+    }
+
+    // If no dependencies were found, return all stages up to the target
+    if dependencies.is_empty() {
+        return stages[..=target_index].to_vec();
+    }
+
+    // Collect only the stages that are needed
+    let mut used_stages = Vec::new();
+    for i in 0..target_index {
+        let s = &stages[i];
+        let alias_lower = s.alias.as_ref().map(|a| a.to_lowercase());
+        if alias_lower.as_ref() == Some(&last_stage_base)
+            || dependencies.contains(&alias_lower.unwrap_or_default())
+        {
+            used_stages.push(s.clone());
+        }
+    }
+
+    // Always include the target stage
+    used_stages.push(stages[target_index].clone());
+    used_stages
+}
+
+/// Build a mapping from stage names to their indices.
+/// Analogous to Go: `stageNameToIdx` construction in `MakeKanikoStages()`.
+pub fn build_stage_name_to_index(stages: &[Stage]) -> HashMap<String, usize> {
+    let mut map = HashMap::new();
+    for (i, stage) in stages.iter().enumerate() {
+        if let Some(ref alias) = stage.alias {
+            map.insert(alias.to_lowercase(), i);
+        }
+        // Also map numeric index as string
+        map.insert(i.to_string(), i);
+    }
+    map
+}
+
+/// Resolve cross-stage COPY --from references from names to indices.
+///
+/// This function modifies the COPY instructions in-place so that
+/// `COPY --from=secondStage` becomes `COPY --from=1` for easier
+/// processing later on.
+///
+/// Analogous to Go: `pkg/dockerfile.ResolveCrossStageCommands()`.
+pub fn resolve_cross_stage_commands(
+    stages: &mut [Stage],
+    stage_name_to_idx: &HashMap<String, usize>,
+) {
+    for stage in stages.iter_mut() {
+        for instruction in stage.instructions.iter_mut() {
+            if let Instruction::Copy(copy) = instruction {
+                if let Some(ref from) = copy.from {
+                    let from_lower = from.to_lowercase();
+                    if let Some(&idx) = stage_name_to_idx.get(&from_lower) {
+                        copy.from = Some(idx.to_string());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Strip enclosing quotes from ARG default values.
+///
+/// If the quotes are escaped (e.g. `\"value\"`), they are left as-is.
+/// Analogous to Go: `pkg/dockerfile.stripEnclosingQuotes()`.
+pub fn strip_enclosing_quotes(value: &str) -> Result<String> {
+    let backslash = b'\\';
+    let bytes = value.as_bytes();
+
+    if bytes.len() < 2 {
+        return Ok(value.to_string());
+    }
+
+    let mut leader = String::new();
+    let mut tail = String::new();
+
+    match bytes[0] {
+        b'\'' | b'"' => {
+            leader.push(bytes[0] as char);
+        }
+        b'\\' => {
+            if bytes.len() > 1 {
+                match bytes[1] {
+                    b'\'' | b'"' => {
+                        leader.push(bytes[0] as char);
+                        leader.push(bytes[1] as char);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // If the leader is more than one character, it's an escaped character
+    if leader.len() < 2 {
+        match bytes[bytes.len() - 1] {
+            b'\'' | b'"' => {
+                tail.push(bytes[bytes.len() - 1] as char);
+            }
+            _ => {}
+        }
+    } else {
+        let last_two = &value[value.len() - 2..];
+        if last_two == "\\'" || last_two == "\\\"" {
+            tail = last_two.to_string();
+        }
+    }
+
+    if leader != tail {
+        // Mismatched quotes — but we just log and return the original value
+        // (Go version would return an error, but we're more lenient here)
+        return Ok(value.to_string());
+    }
+
+    if leader.is_empty() {
+        return Ok(value.to_string());
+    }
+
+    // If escaped, leave as-is
+    if leader.len() == 2 {
+        return Ok(value.to_string());
+    }
+
+    // Strip the enclosing quotes
+    Ok(value[1..value.len() - 1].to_string())
+}
+
+/// Expand nested ARG references in meta ARGs.
+///
+/// Tries to resolve each ARG value against previously defined ARGs
+/// and runtime build args.
+///
+/// Analogous to Go: `pkg/dockerfile.expandNestedArgs()`.
+pub fn expand_nested_args(
+    meta_args: &[(String, Option<String>)],
+    build_args: &HashMap<String, String>,
+) -> Vec<(String, Option<String>)> {
+    let mut prev_args: Vec<String> = Vec::new();
+    let mut result = Vec::with_capacity(meta_args.len());
+
+    for (key, value) in meta_args {
+        let new_value = if let Some(v) = value {
+            // Combine previous args and build args for resolution
+            let mut combined: Vec<String> = prev_args.clone();
+            for (k, v) in build_args {
+                combined.push(format!("{}={}", k, v));
+            }
+            let resolved = resolve_arg_value(v, &combined);
+            prev_args.push(format!("{}={}", key, resolved));
+            Some(resolved)
+        } else {
+            prev_args.push(key.clone());
+            None
+        };
+        result.push((key.clone(), new_value));
+    }
+
+    result
+}
+
+/// Resolve ARG value references like `$VAR` or `${VAR}` against a list of KEY=VALUE pairs.
+fn resolve_arg_value(value: &str, args: &[String]) -> String {
+    let mut result = value.to_string();
+    for arg in args {
+        if let Some((key, val)) = arg.split_once('=') {
+            // Replace ${KEY} first (longer match)
+            let bracket_ref = format!("${{{}}}", key);
+            if result.contains(&bracket_ref) {
+                result = result.replace(&bracket_ref, val);
+            }
+            // Replace $KEY
+            let dollar_ref = format!("${}", key);
+            // Only replace if not already handled by ${} form
+            if result.contains(&dollar_ref) && !result.contains(&bracket_ref) {
+                result = result.replace(&dollar_ref, val);
+            }
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests_stage_analysis {
+    use super::*;
+
+    #[test]
+    fn test_skip_unused_stages_no_deps() {
+        let dockerfile = r#"
+FROM ubuntu:20.04 AS builder
+RUN echo builder
+
+FROM debian:10 AS unused
+RUN echo unused
+
+FROM ubuntu:20.04
+COPY --from=builder /app /app
+"#;
+        let stages = parse_dockerfile(dockerfile).unwrap();
+        let used = skip_unused_stages(&stages, 2);
+        assert_eq!(used.len(), 2); // builder + final, skip "unused"
+        assert_eq!(used[0].alias.as_deref(), Some("builder"));
+        assert!(used[1].alias.is_none()); // final stage has no alias
+    }
+
+    #[test]
+    fn test_skip_unused_stages_all_used() {
+        let dockerfile = r#"
+FROM ubuntu:20.04 AS stage1
+FROM stage1 AS stage2
+FROM stage2 AS stage3
+"#;
+        let stages = parse_dockerfile(dockerfile).unwrap();
+        let used = skip_unused_stages(&stages, 2);
+        assert_eq!(used.len(), 3); // all stages are used
+    }
+
+    #[test]
+    fn test_build_stage_name_to_index() {
+        let dockerfile = r#"
+FROM ubuntu:20.04 AS build
+FROM debian:10 AS test
+FROM alpine:3 AS final
+"#;
+        let stages = parse_dockerfile(dockerfile).unwrap();
+        let map = build_stage_name_to_index(&stages);
+        assert_eq!(map.get("build"), Some(&0));
+        assert_eq!(map.get("test"), Some(&1));
+        assert_eq!(map.get("final"), Some(&2));
+        assert_eq!(map.get("0"), Some(&0));
+    }
+
+    #[test]
+    fn test_resolve_cross_stage_commands() {
+        let dockerfile = r#"
+FROM ubuntu:20.04 AS builder
+RUN echo builder
+FROM alpine:3
+COPY --from=builder /app /app
+"#;
+        let mut stages = parse_dockerfile(dockerfile).unwrap();
+        let map = build_stage_name_to_index(&stages);
+        resolve_cross_stage_commands(&mut stages, &map);
+        // The COPY --from=builder should now be COPY --from=0
+        match &stages[1].instructions[0] {
+            Instruction::Copy(copy) => {
+                assert_eq!(copy.from, Some("0".to_string()));
+            }
+            other => panic!("Expected COPY, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_strip_enclosing_quotes_double() {
+        assert_eq!(strip_enclosing_quotes(r#""hello""#).unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_strip_enclosing_quotes_single() {
+        assert_eq!(strip_enclosing_quotes("'hello'").unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_strip_enclosing_quotes_escaped() {
+        // Escaped quotes should be left as-is
+        assert_eq!(strip_enclosing_quotes(r#"\"hello\""#).unwrap(), r#"\"hello\""#);
+    }
+
+    #[test]
+    fn test_strip_enclosing_quotes_no_quotes() {
+        assert_eq!(strip_enclosing_quotes("hello").unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_strip_enclosing_quotes_empty() {
+        assert_eq!(strip_enclosing_quotes("").unwrap(), "");
+    }
+
+    #[test]
+    fn test_expand_nested_args() {
+        let meta_args = vec![
+            ("BASE_IMAGE".to_string(), Some("ubuntu:20.04".to_string())),
+            ("APP_IMAGE".to_string(), Some("${BASE_IMAGE}".to_string())),
+        ];
+        let build_args = HashMap::new();
+        let result = expand_nested_args(&meta_args, &build_args);
+        assert_eq!(result[0].1, Some("ubuntu:20.04".to_string()));
+        assert_eq!(result[1].1, Some("ubuntu:20.04".to_string()));
+    }
+
+    #[test]
+    fn test_expand_nested_args_with_build_args() {
+        let meta_args = vec![
+            ("VERSION".to_string(), Some("1.0".to_string())),
+        ];
+        let mut build_args = HashMap::new();
+        build_args.insert("VERSION".to_string(), "2.0".to_string());
+        let result = expand_nested_args(&meta_args, &build_args);
+        // Build args should be used in resolution
+        assert_eq!(result[0].1, Some("1.0".to_string())); // meta arg keeps its own value
+    }
+}

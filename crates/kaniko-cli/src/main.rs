@@ -37,6 +37,16 @@ use std::path::PathBuf;
 async fn main() {
     let cli = Cli::parse();
 
+    // Handle subcommands first
+    if let Some(ref cmd) = cli.command {
+        match cmd {
+            args::Commands::Version => {
+                println!("Kaniko version : {}", kaniko_core::VERSION);
+                return;
+            }
+        }
+    }
+
     // Configure logging based on CLI args
     init_logging(&cli.log_level, &cli.log_format);
 
@@ -77,6 +87,11 @@ fn init_logging(level: &str, format: &str) {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .json()
+            .init();
+    } else if format == "color" {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(true)
             .init();
     } else {
         tracing_subscriber::fmt()
@@ -789,9 +804,8 @@ fn build_registry_options(cli: &Cli) -> RegistryOptions {
     // Skip TLS verify registries
     opts.skip_tls_verify_registries = cli.skip_tls_verify_registry.clone();
 
-    // Registry mirrors
+    // Registry mirrors — format: "registry=mirror"
     for mirror_spec in &cli.registry_mirror {
-        // Format: "registry=mirror" e.g. "docker.io=mirror.example.com"
         if let Some((registry, mirror_url)) = mirror_spec.split_once('=') {
             opts.registry_mirrors
                 .entry(registry.to_string())
@@ -801,6 +815,44 @@ fn build_registry_options(cli: &Cli) -> RegistryOptions {
             tracing::warn!("Invalid registry mirror spec (expected registry=mirror): {}", mirror_spec);
         }
     }
+
+    // Registry maps — format: "original.registry=new.registry" or "original.registry=new.registry/prefix/"
+    // Analogous to Go: `opts.RegistryMaps`
+    for map_spec in &cli.registry_map {
+        if let Some((source, dest)) = map_spec.split_once('=') {
+            opts.registry_maps
+                .entry(source.to_lowercase())
+                .or_default()
+                .push(dest.to_string());
+        } else {
+            tracing::warn!("Invalid registry map spec (expected original=new): {}", map_spec);
+        }
+    }
+
+    // Registry certificates — format: "my.registry.url=/path/to/cert"
+    // Analogous to Go: `opts.RegistriesCertificates`
+    for cert_spec in &cli.registry_certificate {
+        if let Some((registry, cert_path)) = cert_spec.split_once('=') {
+            opts.registry_certificates
+                .insert(registry.to_string(), PathBuf::from(cert_path));
+        } else {
+            tracing::warn!("Invalid registry certificate spec (expected registry=/path/to/cert): {}", cert_spec);
+        }
+    }
+
+    // Registry client certificates — format: "my.registry.url=/path/to/cert,/path/to/key"
+    // Analogous to Go: `opts.RegistriesClientCertificates`
+    for cert_spec in &cli.registry_client_cert {
+        if let Some((registry, certs)) = cert_spec.split_once('=') {
+            opts.registry_client_certificates
+                .insert(registry.to_string(), certs.to_string());
+        } else {
+            tracing::warn!("Invalid registry client cert spec (expected registry=cert,key): {}", cert_spec);
+        }
+    }
+
+    // Skip default registry fallback
+    opts.skip_default_registry_fallback = cli.skip_default_registry_fallback;
 
     opts
 }

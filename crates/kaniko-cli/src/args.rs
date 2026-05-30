@@ -27,7 +27,12 @@ impl std::fmt::Display for Compression {
 /// kaniko-rs executor — build container images without a daemon.
 #[derive(Parser, Debug)]
 #[command(name = "kaniko-executor", version, about = "Build container images in Kubernetes")]
+#[command(propagate_version = true)]
 pub struct Cli {
+    /// Subcommand (e.g. "version").
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+
     // ===== Core build options =====
 
     /// Path to the Dockerfile.
@@ -35,8 +40,12 @@ pub struct Cli {
     pub dockerfile: Option<String>,
 
     /// Path to the build context directory.
-    #[arg(short, long, default_value = ".")]
+    #[arg(short, long, default_value = "/workspace/")]
     pub context: Option<String>,
+
+    /// Sub path within the given context.
+    #[arg(long)]
+    pub context_sub_path: Option<String>,
 
     /// Image destination(s) to push to.
     #[arg(short, long)]
@@ -111,6 +120,25 @@ pub struct Cli {
     #[arg(long)]
     pub registry_mirror: Vec<String>,
 
+    /// Registry map of mirror to use as pull-through cache instead.
+    /// Expected format: 'original.registry=new.registry' or 'original.registry=new.registry/prefix/'.
+    #[arg(long)]
+    pub registry_map: Vec<String>,
+
+    /// Use the provided certificate for TLS communication with the given registry.
+    /// Expected format: 'my.registry.url=/path/to/the/server/certificate'.
+    #[arg(long)]
+    pub registry_certificate: Vec<String>,
+
+    /// Use the provided client certificate for mutual TLS (mTLS) communication with the given registry.
+    /// Expected format: 'my.registry.url=/path/to/client/cert,/path/to/client/key'.
+    #[arg(long)]
+    pub registry_client_cert: Vec<String>,
+
+    /// If an image is not found on any mirrors do not fallback to the default registry.
+    #[arg(long)]
+    pub skip_default_registry_fallback: bool,
+
     /// Number of retries for the push operation.
     #[arg(long, default_value_t = 0)]
     pub push_retry: u32,
@@ -175,6 +203,10 @@ pub struct Cli {
     #[arg(long)]
     pub platform: Vec<String>,
 
+    /// Specify the build platform if different from the current host.
+    #[arg(long)]
+    pub custom_platform: Option<String>,
+
     /// Use single snapshot mode.
     #[arg(long)]
     pub single_snapshot: bool,
@@ -219,6 +251,18 @@ pub struct Cli {
     #[arg(long, default_value_t = -1)]
     pub compression_level: i32,
 
+    /// Path to the kaniko directory.
+    #[arg(long, default_value = "/kaniko")]
+    pub kaniko_dir: String,
+
+    /// Git options for build context. Format: branch=main,single-branch=true,recurse-submodules=true,insecure-skip-tls=false.
+    #[arg(long)]
+    pub git: Option<String>,
+
+    /// Name of the GCS bucket from which to access build context as tarball.
+    #[arg(long)]
+    pub bucket: Option<String>,
+
     // ===== Sandbox options =====
 
     /// Build the image filesystem inside /kaniko/sandbox instead of the container root filesystem.
@@ -235,13 +279,24 @@ pub struct Cli {
     #[arg(short, long, default_value = "info")]
     pub log_level: String,
 
-    /// Log format (text, json).
+    /// Log format (text, json, color).
     #[arg(long, default_value = "text")]
     pub log_format: String,
+
+    /// Include timestamp in log output.
+    #[arg(long)]
+    pub log_timestamp: bool,
 
     /// Force building outside of a container.
     #[arg(long)]
     pub force: bool,
+}
+
+/// Subcommands for kaniko-executor.
+#[derive(Parser, Debug)]
+pub enum Commands {
+    /// Print the version number of kaniko.
+    Version,
 }
 
 /// Parse build argument in KEY=VALUE format.

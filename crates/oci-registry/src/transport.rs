@@ -33,6 +33,9 @@ pub struct RegistryOptions {
     pub skip_tls_verify_registries: Vec<String>,
     /// Registry mirrors for pull-through caching (e.g. "docker.io" -> "mirror.example.com").
     pub registry_mirrors: HashMap<String, Vec<String>>,
+    /// Registry maps for remapping image references (e.g. "docker.io" -> "my-registry.example.com/prefix/").
+    /// Analogous to Go: `opts.RegistryMaps`.
+    pub registry_maps: HashMap<String, Vec<String>>,
     /// Skip default registry fallback when mirrors don't have the image.
     pub skip_default_registry_fallback: bool,
     /// Path to CA certificates per registry (registry -> cert_path).
@@ -77,6 +80,49 @@ impl RegistryOptions {
             }
         }
         reference.to_string()
+    }
+
+    /// Remap a reference using registry-maps if configured.
+    /// This is a more advanced version of mirrors that supports repository prefixes.
+    /// Analogous to Go: `pkg/image/remote.retrieveRemoteImage()` registry mapping.
+    ///
+    /// Returns None if no mapping is configured for the reference's registry.
+    pub fn remap_with_registry_map(&self, reference: &str) -> Option<String> {
+        // Parse "registry/repo:tag" format
+        let (host, rest) = reference.split_once('/')?;
+        let mapped_urls = self.registry_maps.get(host.to_lowercase().as_str())?;
+
+        // Try each mapped URL in order
+        for mapping in mapped_urls {
+            // Parse the mapping: "registry.example.com/subdir1/subdir2"
+            let (reg_to_map_to, repository_prefix) = parse_registry_mapping(mapping);
+            let remapped = match repository_prefix {
+                Some(prefix) => format!("{}/{}{}", reg_to_map_to, prefix, rest),
+                None => format!("{}/{}", reg_to_map_to, rest),
+            };
+            return Some(remapped);
+        }
+
+        None
+    }
+}
+
+/// Parse a registry mapping string into (registry_url, repository_prefix).
+/// Analogous to Go: `parseRegistryMapping()`.
+///
+/// Example: "registry.example.com/subdir1/subdir2" returns
+///   ("registry.example.com", Some("subdir1/subdir2/"))
+fn parse_registry_mapping(reg_mapping: &str) -> (&str, Option<String>) {
+    if let Some((reg_url, prefix)) = reg_mapping.split_once('/') {
+        if prefix.is_empty() {
+            (reg_url, None)
+        } else if prefix.ends_with('/') {
+            (reg_url, Some(prefix.to_string()))
+        } else {
+            (reg_url, Some(format!("{}/", prefix)))
+        }
+    } else {
+        (reg_mapping, None)
     }
 }
 

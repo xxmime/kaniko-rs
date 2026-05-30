@@ -1248,6 +1248,7 @@ version = "0.1.0"
 dependencies = [
  "kaniko-creds",
  "oci-image",
+ "once_cell",
  "reqwest",
  "serde",
  "serde_json",

@@ -15,6 +15,15 @@ use oci_image::config::ImageConfig;
 use oci_image::layer::Layer;
 use oci_image::manifest::{Manifest, MediaType};
 use oci_image::mutate::MutableImage;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use once_cell::sync::Lazy;
+
+/// Global manifest cache — avoids re-pulling the same image in multi-stage builds.
+/// Analogous to Go: `pkg/image/remote.manifestCache`.
+static MANIFEST_CACHE: Lazy<Mutex<HashMap<String, MutableImage>>> = Lazy::new(|| {
+    Mutex::new(HashMap::new())
+});
 
 /// Errors during pull operations.
 #[derive(Debug, thiserror::Error)]
@@ -37,10 +46,20 @@ pub enum PullError {
 pub type Result<T> = std::result::Result<T, PullError>;
 
 /// Pull an image from a registry following the OCI Distribution Spec.
+/// Results are cached globally — subsequent pulls for the same reference
+/// return the cached image.
+/// Analogous to Go: `pkg/image/remote.RetrieveRemoteImage()`.
 pub async fn pull_image(
     reference_str: &str,
     auth: &RegistryAuth,
 ) -> Result<MutableImage> {
+    // Check cache first
+    if let Ok(cache) = MANIFEST_CACHE.lock() {
+        if let Some(cached) = cache.get(reference_str) {
+            tracing::info!("Returning cached image manifest for {}", reference_str);
+            return Ok(cached.clone());
+        }
+    }
     let reference = Reference::parse(reference_str)
         .map_err(|e| PullError::Failed(e.to_string()))?;
     let base_url = reference.base_url(auth.insecure);
@@ -72,12 +91,19 @@ pub async fn pull_image(
 
     tracing::info!("Successfully pulled {} with {} layers", reference_str, layers.len());
 
-    Ok(MutableImage {
+    let image = MutableImage {
         manifest,
         config,
         config_bytes,
         layers,
-    })
+    };
+
+    // Cache the pulled image for future use
+    if let Ok(mut cache) = MANIFEST_CACHE.lock() {
+        cache.insert(reference_str.to_string(), image.clone());
+    }
+
+    Ok(image)
 }
 
 /// Fetch the manifest for a tag/reference.
