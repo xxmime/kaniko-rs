@@ -11,6 +11,7 @@ pub mod walker;
 pub mod fs_util;
 pub mod container;
 pub mod command_util;
+pub mod tar_util;
 
 pub use ignore_list::{
     IgnoreListEntry, KANIKO_DIR,
@@ -38,4 +39,8 @@ pub use command_util::{
     is_srcs_valid, is_dest_dir_in_root, url_destination_filepath,
     get_user_group, get_chmod,
     DO_NOT_CHANGE_UID, DO_NOT_CHANGE_GID,
+};
+pub use tar_util::{
+    TarWriter, create_tarball_of_directory, tar_path_from_root,
+    is_file_local_tar_archive, unpack_local_tar_archive, unpack_compressed_tar,
 };

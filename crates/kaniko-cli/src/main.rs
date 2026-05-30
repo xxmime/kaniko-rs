@@ -163,15 +163,47 @@ async fn run(mut cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync
     tracing::info!("Parsed {} stage(s)", stages.len());
 
     // ===== Step 2: Check push permissions (unless skipped) =====
-    if !cli.skip_push_permission_check && !cli.no_push && !cli.destination.is_empty() {
-        for dest in &cli.destination {
-            let registry = extract_registry(dest);
-            let credential = keychain.credentials(&registry)
-                .unwrap_or_else(|_| kaniko_creds::Credential::anonymous());
-            let auth = RegistryAuth::new(&registry, credential)
-                .insecure(cli.insecure);
-            if let Err(e) = check_push_permission(dest, &auth).await {
-                tracing::warn!("Push permission check failed for {}: {}", dest, e);
+    // Analogous to Go: `executor.CheckPushPermissions(opts)`.
+    // Logic: skip if --skip-push-permission-check; skip if --no-push && --no-push-cache;
+    // if --no-push but not --no-push-cache, check cache-repo instead of destinations.
+    {
+        let should_check = if cli.skip_push_permission_check {
+            false
+        } else if cli.no_push && cli.no_push_cache {
+            false
+        } else if cli.no_push && !cli.no_push_cache {
+            // Check cache repo instead of destinations
+            if let Some(ref cache_repo) = cli.cache_repo {
+                if cache_repo.starts_with("oci:") {
+                    false // OCI layout doesn't need push permission check
+                } else {
+                    let registry = extract_registry(cache_repo);
+                    let credential = keychain.credentials(&registry)
+                        .unwrap_or_else(|_| kaniko_creds::Credential::anonymous());
+                    let auth = RegistryAuth::new(&registry, credential)
+                        .insecure(cli.insecure);
+                    if let Err(e) = check_push_permission(cache_repo, &auth).await {
+                        tracing::warn!("Push permission check failed for cache repo {}: {}", cache_repo, e);
+                    }
+                    false // Don't also check destinations below
+                }
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+
+        if should_check {
+            for dest in &cli.destination {
+                let registry = extract_registry(dest);
+                let credential = keychain.credentials(&registry)
+                    .unwrap_or_else(|_| kaniko_creds::Credential::anonymous());
+                let auth = RegistryAuth::new(&registry, credential)
+                    .insecure(cli.insecure);
+                if let Err(e) = check_push_permission(dest, &auth).await {
+                    tracing::warn!("Push permission check failed for {}: {}", dest, e);
+                }
             }
         }
     }
