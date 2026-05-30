@@ -101,7 +101,7 @@ pub async fn push_layer_to_cache(
     cache_key: &str,
     layer: Layer,
     created_by: &str,
-    cache_dir: &Option<String>,
+    _cache_dir: &Option<String>,
     insecure: bool,
     no_push: bool,
 ) -> Result<()> {

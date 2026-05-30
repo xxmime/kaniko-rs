@@ -297,6 +297,69 @@ pub struct Cli {
 pub enum Commands {
     /// Print the version number of kaniko.
     Version,
+    /// Pre-populate the cache with base images.
+    /// 
+    /// Pulls specified images (or base images from a Dockerfile) and stores
+    /// them in the local cache directory for faster subsequent builds.
+    /// 
+    /// Analogous to Go: `cmd/warmer`.
+    Warmer {
+        /// Image to cache. Can be specified multiple times.
+        #[arg(short, long)]
+        image: Vec<String>,
+
+        /// Directory of the cache.
+        #[arg(short, long, default_value = "/cache")]
+        cache_dir: String,
+
+        /// Force cache overwriting.
+        #[arg(short, long)]
+        force: bool,
+
+        /// Cache timeout in hours. Defaults to two weeks (336h).
+        #[arg(long, default_value_t = 336)]
+        cache_ttl: u64,
+
+        /// Pull from insecure registry using plain HTTP.
+        #[arg(long)]
+        insecure_pull: bool,
+
+        /// Pull from insecure registry ignoring TLS verify.
+        #[arg(long)]
+        skip_tls_verify_pull: bool,
+
+        /// Insecure registry using plain HTTP to pull.
+        #[arg(long)]
+        insecure_registry: Vec<String>,
+
+        /// Insecure registry ignoring TLS verify to pull.
+        #[arg(long)]
+        skip_tls_verify_registry: Vec<String>,
+
+        /// Registry mirror to use as pull-through cache instead of docker.io.
+        #[arg(long)]
+        registry_mirror: Vec<String>,
+
+        /// Registry map (original=new format).
+        #[arg(long)]
+        registry_map: Vec<String>,
+
+        /// Specify the build platform if different from the current host.
+        #[arg(long)]
+        custom_platform: Option<String>,
+
+        /// Path to Dockerfile to parse for base images.
+        #[arg(short, long)]
+        dockerfile: Option<String>,
+
+        /// Build arguments for Dockerfile parsing (KEY=VALUE format).
+        #[arg(long, value_parser = parse_build_arg)]
+        build_arg: Vec<(String, String)>,
+
+        /// Path to docker config.json.
+        #[arg(long)]
+        docker_config: Option<String>,
+    },
 }
 
 /// Parse build argument in KEY=VALUE format.
@@ -339,6 +402,42 @@ fn parse_duration(s: &str) -> Option<Duration> {
         'm' => Some(Duration::from_secs(num * 60)),
         's' => Some(Duration::from_secs(num)),
         _ => None,
+    }
+}
+
+/// Parameters for running the warmer subcommand.
+/// Extracted from the Warmer enum variant for convenience.
+pub struct WarmerRun {
+    pub images: Vec<String>,
+    pub cache_dir: String,
+    pub force: bool,
+    pub cache_ttl: u64,
+    pub insecure_pull: bool,
+    pub skip_tls_verify_pull: bool,
+    pub registry_mirrors: Vec<String>,
+    pub registry_maps: Vec<String>,
+    pub custom_platform: Option<String>,
+    pub dockerfile_path: Option<String>,
+    pub build_args: Vec<(String, String)>,
+    pub docker_config: Option<String>,
+}
+
+impl WarmerRun {
+    /// Convert to kaniko_cache::WarmerOptions.
+    pub fn to_warmer_options(&self) -> kaniko_cache::warm::WarmerOptions {
+        kaniko_cache::warm::WarmerOptions {
+            cache_dir: self.cache_dir.clone(),
+            images: self.images.clone(),
+            dockerfile_path: self.dockerfile_path.clone(),
+            force: self.force,
+            cache_ttl_hours: self.cache_ttl,
+            custom_platform: self.custom_platform.clone(),
+            build_args: self.build_args.clone(),
+            insecure_pull: self.insecure_pull,
+            skip_tls_verify_pull: self.skip_tls_verify_pull,
+            registry_mirrors: self.registry_mirrors.clone(),
+            registry_maps: self.registry_maps.clone(),
+        }
     }
 }
 

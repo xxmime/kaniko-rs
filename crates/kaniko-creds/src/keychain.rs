@@ -103,6 +103,15 @@ impl SystemKeychain {
     }
 
     /// Get credentials for the given registry.
+    ///
+    /// Checks multiple sources in order (analogous to Go: `GetKeychain()`
+    /// with `authn.NewMultiKeychain`):
+    /// 1. Docker config auths entries
+    /// 2. Docker config credHelpers entries
+    /// 3. Docker config credsStore (default credential store)
+    /// 4. Cloud provider credential helpers (ECR, ACR, GitLab)
+    /// 5. Google cloud keychain (gcloud config)
+    /// 6. Anonymous
     pub fn credentials(&self, registry: &str) -> Result<Credential> {
         let config = self.read_docker_config()?;
 
@@ -122,11 +131,63 @@ impl SystemKeychain {
 
         // 3. Check default credential store
         if let Some(store) = &config.creds_store {
-            return crate::helper::call_credential_helper(store, registry);
+            if let Ok(cred) = crate::helper::call_credential_helper(store, registry) {
+                return Ok(cred);
+            }
         }
 
-        // 4. Anonymous
+        // 4. Cloud provider credential helpers
+        //    Try each cloud-specific helper if the registry matches the pattern.
+        //    Analogous to Go: `authn.NewKeychainFromHelper(ecr.NewECRHelper(...))` etc.
+        if let Some(cred) = self.try_cloud_helpers(registry) {
+            return Ok(cred);
+        }
+
+        // 5. Anonymous
         Ok(Credential::anonymous())
+    }
+
+    /// Try cloud provider credential helpers based on registry URL patterns.
+    ///
+    /// Analogous to Go: `GetKeychain()` combining ECR/ACR/GitLab helpers
+    /// via `authn.NewMultiKeychain`.
+    fn try_cloud_helpers(&self, registry: &str) -> Option<Credential> {
+        // ECR: *.dkr.ecr.*.amazonaws.com
+        if registry.contains(".dkr.ecr.") && registry.contains(".amazonaws.com") {
+            tracing::debug!("Trying ECR credential helper for {}", registry);
+            if let Ok(cred) = crate::helper::call_credential_helper("ecr-login", registry) {
+                return Some(cred);
+            }
+        }
+
+        // ACR (Azure): *.azurecr.io
+        if registry.ends_with(".azurecr.io") {
+            tracing::debug!("Trying ACR credential helper for {}", registry);
+            if let Ok(cred) = crate::helper::call_credential_helper("acr-env", registry) {
+                return Some(cred);
+            }
+        }
+
+        // GitLab: registry.gitlab.*
+        if registry.contains("registry.gitlab") {
+            tracing::debug!("Trying GitLab credential helper for {}", registry);
+            if let Ok(cred) = crate::helper::call_credential_helper("gitlabci", registry) {
+                return Some(cred);
+            }
+        }
+
+        // Google: gcr.io, *.pkg.dev, *.gcr.io
+        if registry.ends_with("gcr.io") || registry.contains(".gcr.io")
+            || registry.ends_with(".pkg.dev") || registry.contains("artifacts.")
+        {
+            tracing::debug!("Trying Google credential helper for {}", registry);
+            // Google uses gcloud as credential helper
+            if let Ok(cred) = crate::helper::call_credential_helper("gcloud", registry) {
+                return Some(cred);
+            }
+        }
+
+        None
     }
 
     fn read_docker_config(&self) -> Result<DockerConfig> {

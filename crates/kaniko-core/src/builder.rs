@@ -225,7 +225,7 @@ impl StageBuilder {
         // Apply optimizations — replace cacheable commands with cached versions.
         // Analogous to Go: `stageBuilder.optimize()`.
         if self.opts.cache {
-            if let Err(e) = self.optimize(&mut composite_key) {
+            if let Err(e) = self.optimize(&mut composite_key).await {
                 tracing::warn!("Optimize failed: {}", e);
             }
         }
@@ -739,7 +739,7 @@ impl StageBuilder {
     /// output is discarded.
     ///
     /// Analogous to Go: `stageBuilder.optimize()`.
-    fn optimize(
+    async fn optimize(
         &mut self,
         composite_key: &mut crate::command::CompositeCache,
     ) -> Result<()> {
@@ -820,21 +820,25 @@ impl StageBuilder {
                 }
             }
 
-            // Execute metadata-only commands to track state
-            // (we need their effect on config for proper cache keys)
+            // Execute metadata-only commands to update config state.
+            // This is critical for correct cache key computation:
+            // ENV/ARG changes affect subsequent ARG/ENV resolution,
+            // WORKDIR changes affect COPY destinations, USER changes
+            // affect RUN execution, etc.
+            //
             // Analogous to Go: `optimize()` calls `command.ExecuteCommand(config, buildArgs)`
             // for metadata-only commands to update the config state.
             if command.metadata_only() {
                 tracing::debug!(
-                    "Optimize: metadata-only command (state tracked via command_string): {}",
+                    "Optimize: executing metadata-only command: {}",
                     cmd_str
                 );
-                // Note: In Go, metadata-only commands like ENV, LABEL, EXPOSE, USER, etc.
-                // are executed during optimize to update the config. In Rust, these
-                // commands modify config during the main build loop. The optimize
-                // phase only needs to compute cache keys, which are based on
-                // command_string() and files_used_from_context(), so we don't need
-                // to execute them here.
+                if let Err(e) = command.execute(&mut self.image.config.config, &self.args).await {
+                    tracing::debug!(
+                        "Optimize: metadata-only command execution failed (non-fatal): {}",
+                        e
+                    );
+                }
             }
         }
 

@@ -57,6 +57,9 @@ flate2 = "1"
 # Lazy static
 once_cell = "1"
 
+# Regex
+regex = "1"
+
 # Filesystem
 walkdir = "2"
 

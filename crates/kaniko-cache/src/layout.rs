@@ -250,7 +250,7 @@ pub fn cached_image_from_path(path: &std::path::Path) -> Result<MutableImage> {
     let file = std::fs::File::open(path)?;
     let mut archive = tar::Archive::new(file);
 
-    let mut manifest: Option<Manifest> = None;
+    let manifest: Option<Manifest> = None;
     let mut config: Option<ImageConfig> = None;
     let mut config_bytes: Option<Vec<u8>> = None;
     let mut layers: Vec<Layer> = Vec::new();
@@ -269,7 +269,7 @@ pub fn cached_image_from_path(path: &std::path::Path) -> Result<MutableImage> {
             // Docker tar manifest is an array
             let manifests: Vec<serde_json::Value> = serde_json::from_slice(&bytes)?;
             if let Some(first) = manifests.first() {
-                if let Some(config_file) = first.get("Config").and_then(|c| c.as_str()) {
+                if let Some(_config_file) = first.get("Config").and_then(|c| c.as_str()) {
                     // Will be processed in a subsequent entry
                 }
             }

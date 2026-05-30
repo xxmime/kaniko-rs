@@ -44,6 +44,38 @@ async fn main() {
                 println!("Kaniko version : {}", kaniko_core::VERSION);
                 return;
             }
+            args::Commands::Warmer {
+                image,
+                cache_dir,
+                force,
+                cache_ttl,
+                insecure_pull,
+                skip_tls_verify_pull,
+                insecure_registry: _,
+                skip_tls_verify_registry: _,
+                registry_mirror,
+                registry_map,
+                custom_platform,
+                dockerfile,
+                build_arg,
+                docker_config,
+            } => {
+                run_warmer(args::WarmerRun {
+                    images: image.clone(),
+                    cache_dir: cache_dir.clone(),
+                    force: *force,
+                    cache_ttl: *cache_ttl,
+                    insecure_pull: *insecure_pull,
+                    skip_tls_verify_pull: *skip_tls_verify_pull,
+                    registry_mirrors: registry_mirror.clone(),
+                    registry_maps: registry_map.clone(),
+                    custom_platform: custom_platform.clone(),
+                    dockerfile_path: dockerfile.clone(),
+                    build_args: build_arg.clone(),
+                    docker_config: docker_config.clone(),
+                }).await;
+                return;
+            }
         }
     }
 
@@ -1107,5 +1139,69 @@ fn apply_sandbox(sandbox: bool) {
             "Sandbox mode is not supported on this platform. \
              Build will proceed without namespace isolation."
         );
+    }
+}
+
+/// Run the cache warmer subcommand.
+///
+/// Analogous to Go: `cmd/warmer/cmd/root.go` — RootCmd.Run.
+async fn run_warmer(params: args::WarmerRun) {
+    // Configure logging
+    init_logging("info", "color", true);
+
+    tracing::info!("kaniko-rs cache warmer starting");
+
+    // Validate: at least one image or a dockerfile must be specified
+    if params.images.is_empty() && params.dockerfile_path.is_none() {
+        tracing::error!("You must select at least one image to cache or a dockerfile path to parse");
+        std::process::exit(1);
+    }
+
+    // Validate dockerfile path if specified
+    if let Some(ref dockerfile_path) = params.dockerfile_path {
+        if !dockerfile_path.starts_with("http://") && !dockerfile_path.starts_with("https://") {
+            let path = std::path::Path::new(dockerfile_path);
+            if !path.exists() {
+                tracing::error!(
+                    "Please provide a valid path to a Dockerfile within the build context with --dockerfile"
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Ensure cache directory exists
+    let cache_dir = std::path::Path::new(&params.cache_dir);
+    if !cache_dir.exists() {
+        if let Err(e) = std::fs::create_dir_all(cache_dir) {
+            tracing::error!("Failed to create cache directory: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    // Resolve credentials
+    let keychain = if let Some(ref config_path) = params.docker_config {
+        SystemKeychain::with_config_path(PathBuf::from(config_path))
+    } else {
+        SystemKeychain::new()
+    };
+
+    // Build registry auth — use anonymous for warming, per-image auth not needed
+    // The warmer pulls images from various registries, so we use a generic auth.
+    // Actual per-registry auth is resolved during pull.
+    let auth = RegistryAuth::anonymous("")
+        .insecure(params.insecure_pull);
+
+    // Convert to WarmerOptions and run
+    let warmer_opts = params.to_warmer_options();
+
+    match kaniko_cache::warm_cache(&warmer_opts, &auth).await {
+        Ok(()) => {
+            tracing::info!("Cache warming completed successfully");
+        }
+        Err(e) => {
+            tracing::error!("Failed warming cache: {}", e);
+            std::process::exit(1);
+        }
     }
 }

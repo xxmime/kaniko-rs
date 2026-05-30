@@ -8,7 +8,9 @@
 pub mod registry;
 pub mod layout;
 pub mod push;
+pub mod warm;
 
 pub use registry::RegistryCache;
 pub use layout::{LayoutCache, locate_image, cached_image_from_path};
 pub use push::{cache_destination, push_layer_to_cache, PushCacheError};
+pub use warm::{warm_cache, parse_dockerfile_for_warming, WarmerOptions, WarmError};

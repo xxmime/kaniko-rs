@@ -12,6 +12,7 @@ use crate::auth::RegistryAuth;
 use crate::push::Reference;
 use crate::transport::{build_client, RetryConfig};
 use oci_image::config::ImageConfig;
+use oci_image::index::IndexManifest;
 use oci_image::layer::Layer;
 use oci_image::manifest::{Manifest, MediaType};
 use oci_image::mutate::MutableImage;
@@ -178,14 +179,9 @@ async fn get_manifest_with_platform(
         || content_type.contains("index.v1")
         || content_type.contains("image.index")
     {
-        // Parse as manifest index
-        let index: serde_json::Value = serde_json::from_slice(&body)
+        // Parse as OCI Image Index using typed IndexManifest
+        let index: IndexManifest = serde_json::from_slice(&body)
             .map_err(|e| PullError::Failed(format!("failed to parse manifest index: {}", e)))?;
-
-        let manifests = index
-            .get("manifests")
-            .and_then(|m| m.as_array())
-            .ok_or_else(|| PullError::Failed("manifest index has no manifests array".to_string()))?;
 
         // Parse target platform
         let (target_os, target_arch) = match platform {
@@ -203,31 +199,16 @@ async fn get_manifest_with_platform(
 
         tracing::info!("Selecting platform {}/{} from manifest list", target_os, target_arch);
 
-        // Find matching manifest descriptor
-        let mut selected_digest: Option<String> = None;
-        for m in manifests {
-            let platform_obj = m.get("platform");
-            if let Some(plat) = platform_obj {
-                let m_os = plat.get("os").and_then(|v| v.as_str()).unwrap_or("");
-                let m_arch = plat.get("architecture").and_then(|v| v.as_str()).unwrap_or("");
-                if m_os == target_os && m_arch == target_arch {
-                    selected_digest = m.get("digest").and_then(|d| d.as_str()).map(|s| s.to_string());
-                    break;
-                }
-            } else {
-                // No platform info — could be a non-list manifest, use digest directly
-                if selected_digest.is_none() {
-                    selected_digest = m.get("digest").and_then(|d| d.as_str()).map(|s| s.to_string());
-                }
-            }
-        }
-
-        let digest = selected_digest.ok_or_else(|| {
-            PullError::Failed(format!(
-                "no manifest found for platform {}/{}",
-                target_os, target_arch
-            ))
-        })?;
+        // Find matching manifest descriptor using IndexManifest's find_manifest
+        let selected = index.find_manifest(&target_arch, &target_os);
+        let digest = selected
+            .map(|d| d.digest.to_string())
+            .ok_or_else(|| {
+                PullError::Failed(format!(
+                    "no manifest found for platform {}/{}",
+                    target_os, target_arch
+                ))
+            })?;
 
         tracing::info!("Selected manifest digest: {}", digest);
 

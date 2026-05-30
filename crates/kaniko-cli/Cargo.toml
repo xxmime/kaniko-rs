@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 kaniko-core = { workspace = true }
 kaniko-creds = { workspace = true }
+kaniko-cache = { workspace = true }
 kaniko-snapshot = { workspace = true }
 kaniko-util = { path = "../kaniko-util" }
 oci-image = { workspace = true }
