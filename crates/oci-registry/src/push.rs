@@ -9,6 +9,7 @@
 //! 6. Push manifest (PUT /v2/<name>/manifests/<reference>)
 
 use crate::auth::RegistryAuth;
+use crate::reference::{Reference, ReferenceError};
 use oci_image::manifest::MediaType;
 use oci_image::mutate::MutableImage;
 use thiserror::Error;
@@ -28,6 +29,8 @@ pub enum PushError {
     Failed(String),
     #[error("transport error: {0}")]
     Transport(#[from] crate::transport::TransportError),
+    #[error("invalid reference: {0}")]
+    Reference(#[from] ReferenceError),
 }
 
 /// Result type for push operations.
@@ -102,39 +105,6 @@ impl PushOptions {
     pub fn with_registry_options(mut self, opts: crate::transport::RegistryOptions) -> Self {
         self.registry_options = Some(opts);
         self
-    }
-}
-
-/// Parsed reference: registry / repository / tag.
-#[derive(Debug, Clone)]
-pub struct Reference {
-    pub registry: String,
-    pub repository: String,
-    pub tag: String,
-}
-
-impl Reference {
-    /// Parse a reference string like "gcr.io/my-project/my-app:latest".
-    pub fn parse(reference: &str) -> Result<Self> {
-        let (registry, rest) = reference
-            .split_once('/')
-            .ok_or_else(|| PushError::Failed(format!("invalid reference: {}", reference)))?;
-        let (repository, tag) = if let Some((repo, t)) = rest.rsplit_once(':') {
-            (repo.to_string(), t.to_string())
-        } else {
-            (rest.to_string(), "latest".to_string())
-        };
-        Ok(Self {
-            registry: registry.to_string(),
-            repository,
-            tag,
-        })
-    }
-
-    /// Base URL for the v2 API.
-    pub fn base_url(&self, insecure: bool) -> String {
-        let scheme = if insecure { "http" } else { "https" };
-        format!("{}://{}/v2", scheme, self.registry)
     }
 }
 
@@ -630,29 +600,6 @@ fn base64_encode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_reference_parse() {
-        let ref1 = Reference::parse("gcr.io/my-project/my-app:latest").unwrap();
-        assert_eq!(ref1.registry, "gcr.io");
-        assert_eq!(ref1.repository, "my-project/my-app");
-        assert_eq!(ref1.tag, "latest");
-
-        let ref2 = Reference::parse("localhost:5000/my-app:v1").unwrap();
-        assert_eq!(ref2.registry, "localhost:5000");
-        assert_eq!(ref2.repository, "my-app");
-        assert_eq!(ref2.tag, "v1");
-
-        let ref3 = Reference::parse("registry.example.com/app").unwrap();
-        assert_eq!(ref3.tag, "latest"); // default tag
-    }
-
-    #[test]
-    fn test_reference_base_url() {
-        let ref1 = Reference::parse("gcr.io/my-app:latest").unwrap();
-        assert_eq!(ref1.base_url(false), "https://gcr.io/v2");
-        assert_eq!(ref1.base_url(true), "http://gcr.io/v2");
-    }
 
     #[test]
     fn test_push_options_default() {

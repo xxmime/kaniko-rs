@@ -30,7 +30,7 @@ pub enum RegistryCacheError {
     #[error("authentication error: {0}")]
     Auth(String),
     #[error("reference parsing error: {0}")]
-    Reference(#[from] oci_registry::PushError),
+    InvalidReference(#[from] oci_registry::ReferenceError),
     #[error("layer error: {0}")]
     Layer(#[from] oci_image::layer::LayerError),
 }

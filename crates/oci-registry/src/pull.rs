@@ -9,8 +9,8 @@
 //! 6. Assemble MutableImage
 
 use crate::auth::RegistryAuth;
-use crate::push::Reference;
-use crate::transport::{build_client, RetryConfig};
+use crate::reference::{Reference, ReferenceError};
+use crate::transport::build_client;
 use oci_image::config::ImageConfig;
 use oci_image::index::IndexManifest;
 use oci_image::layer::Layer;
@@ -41,6 +41,8 @@ pub enum PullError {
     Failed(String),
     #[error("transport error: {0}")]
     Transport(#[from] crate::transport::TransportError),
+    #[error("invalid reference: {0}")]
+    Reference(#[from] ReferenceError),
 }
 
 /// Result type for pull operations.
@@ -80,8 +82,7 @@ pub async fn pull_image_with_platform(
             return Ok(cached.clone());
         }
     }
-    let reference = Reference::parse(reference_str)
-        .map_err(|e| PullError::Failed(e.to_string()))?;
+    let reference = Reference::parse(reference_str)?;
     let base_url = reference.base_url(auth.insecure);
     let client = build_client(auth.insecure);
 
@@ -286,10 +287,12 @@ async fn authenticate_pull(
             Ok(String::new())
         }
         Err(_) => {
+            // For public repositories (like Docker Hub), we can proceed without credentials
             if auth.credential.username.is_empty() {
-                return Err(PullError::Auth("no credentials available".into()));
+                Ok(String::new())
+            } else {
+                Ok(format!("Basic {}", base64_encode(&format!("{}:{}", auth.credential.username, auth.credential.password))))
             }
-            Ok(format!("Basic {}", base64_encode(&format!("{}:{}", auth.credential.username, auth.credential.password))))
         }
     }
 }

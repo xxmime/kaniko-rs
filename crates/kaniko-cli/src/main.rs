@@ -614,7 +614,7 @@ async fn check_push_permission(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Lightweight check: attempt to get the registry API version.
     // If we can authenticate, we likely have push permission.
-    let reference = oci_registry::push::Reference::parse(dest)
+    let reference = oci_registry::Reference::parse(dest)
         .map_err(|e| format!("Invalid reference {}: {}", dest, e))?;
     let base_url = if auth.insecure {
         format!("http://{}", reference.registry)

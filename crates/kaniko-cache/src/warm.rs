@@ -7,8 +7,8 @@
 
 use crate::layout::LayoutCache;
 use crate::layout::LayoutCacheError;
-use oci_registry::auth::RegistryAuth;
-use oci_registry::pull::pull_image_with_platform;
+use oci_registry::RegistryAuth;
+use oci_registry::pull_image_with_platform;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -20,7 +20,7 @@ pub enum WarmError {
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("pull error: {0}")]
-    Pull(#[from] oci_registry::pull::PullError),
+    Pull(#[from] oci_registry::PullError),
     #[error("layout cache error: {0}")]
     Layout(#[from] LayoutCacheError),
     #[error("image already cached: {0}")]
