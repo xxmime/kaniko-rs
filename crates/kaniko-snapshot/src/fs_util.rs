@@ -853,6 +853,176 @@ fn should_resolve_in_root(path: &str) -> bool {
     path.starts_with(root)
 }
 
+/// Determine target file ownership based on the specified uid/gid.
+///
+/// If uid or gid is set to -1 (DO_NOT_CHANGE), the original file's uid/gid is used.
+/// This allows callers to specify "keep the original ownership" without knowing it.
+///
+/// Analogous to Go: `DetermineTargetFileOwnership(fi, uid, gid)`.
+pub fn determine_target_file_ownership(
+    original_uid: u32,
+    original_gid: u32,
+    target_uid: i64,
+    target_gid: i64,
+) -> (u32, u32) {
+    const DO_NOT_CHANGE: i64 = -1;
+
+    let uid = if target_uid <= DO_NOT_CHANGE {
+        original_uid
+    } else {
+        target_uid as u32
+    };
+
+    let gid = if target_gid <= DO_NOT_CHANGE {
+        original_gid
+    } else {
+        target_gid as u32
+    };
+
+    (uid, gid)
+}
+
+/// Copy a directory from src to dest, excluding files matched by the FileContext.
+/// Returns a list of files that were copied.
+///
+/// Analogous to Go: `CopyDir(src, dest, context, uid, gid, chmod, useDefaultChmod)`.
+pub fn copy_dir_with_exclude(
+    src: &Path,
+    dest: &Path,
+    file_context: &FileContext,
+    uid: i64,
+    gid: i64,
+    chmod: u32,
+    use_default_chmod: bool,
+) -> io::Result<Vec<PathBuf>> {
+    let files = relative_files("", src)?;
+    let mut copied_files = Vec::new();
+
+    for file in &files {
+        let full_path = src.join(file);
+        let clean_path = full_path.to_string_lossy().to_string();
+
+        // Check if file is excluded by .dockerignore
+        if file_context.excludes_file(&clean_path) {
+            tracing::debug!("{} found in .dockerignore, ignoring", clean_path);
+            continue;
+        }
+
+        let dest_path = dest.join(file);
+        let metadata = fs::symlink_metadata(&full_path)?;
+
+        if metadata.is_dir() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = if use_default_chmod {
+                    metadata.permissions().mode()
+                } else {
+                    chmod
+                };
+                let (target_uid, target_gid) = get_target_ownership(&metadata, uid, gid);
+                mkdir_all_with_permissions(
+                    dest_path.to_string_lossy().as_ref(),
+                    mode,
+                    target_uid as i64,
+                    target_gid as i64,
+                )?;
+            }
+            #[cfg(not(unix))]
+            {
+                fs::create_dir_all(&dest_path)?;
+            }
+            copied_files.push(dest_path);
+        } else if is_symlink(&full_path) {
+            // Copy symlink
+            let link_target = fs::read_link(&full_path)?;
+            if dest_path.exists() {
+                fs::remove_file(&dest_path)?;
+            }
+            create_parent_directory(dest_path.to_string_lossy().as_ref())?;
+            fs::soft_link(&link_target, &dest_path)?;
+            copied_files.push(dest_path);
+        } else {
+            // Copy regular file
+            let mode = if use_default_chmod { 0o600 } else { chmod };
+            let (_, was_excluded) = copy_file_with_exclude(
+                &full_path.to_string_lossy(),
+                &dest_path.to_string_lossy(),
+                file_context,
+                uid,
+                gid,
+                mode,
+                use_default_chmod,
+            )?;
+            if !was_excluded {
+                copied_files.push(dest_path);
+            }
+        }
+    }
+
+    Ok(copied_files)
+}
+
+/// Copy a file from src to dest, with .dockerignore exclusion support.
+///
+/// Returns (bool, bool) where the first bool is unused (Go compatibility)
+/// and the second bool indicates if the file was excluded by the FileContext.
+/// If src == dest, it's a no-op (not excluded, not copied).
+///
+/// Analogous to Go: `CopyFile(src, dest, context, uid, gid, chmod, useDefaultChmod) (bool, error)`.
+pub fn copy_file_with_exclude(
+    src: &str,
+    dest: &str,
+    file_context: &FileContext,
+    uid: i64,
+    gid: i64,
+    chmod: u32,
+    use_default_chmod: bool,
+) -> io::Result<(bool, bool)> {
+    // Check if file is excluded by .dockerignore
+    if file_context.excludes_file(src) {
+        tracing::debug!("{} found in .dockerignore, ignoring", src);
+        return Ok((false, true)); // was_excluded=false (no error), excluded=true
+    }
+
+    // No-op if src == dest
+    if src == dest {
+        return Ok((false, false));
+    }
+
+    let src_path = Path::new(src);
+    let dest_path = Path::new(dest);
+
+    // Copy file content
+    fs::copy(src_path, dest_path)?;
+
+    // Set permissions and ownership
+    #[cfg(unix)]
+    {
+        let metadata = fs::metadata(src_path)?;
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if use_default_chmod {
+            metadata.permissions().mode()
+        } else {
+            chmod
+        };
+        let (target_uid, target_gid) = get_target_ownership(&metadata, uid, gid);
+        set_file_permissions(dest, mode, target_uid, target_gid)?;
+    }
+
+    Ok((false, false)) // not excluded
+}
+
+/// Helper to get target ownership from metadata and specified uid/gid.
+/// Uses determine_target_file_ownership with the file's original uid/gid.
+#[cfg(unix)]
+fn get_target_ownership(metadata: &fs::Metadata, uid: i64, gid: i64) -> (u32, u32) {
+    use std::os::unix::fs::MetadataExt;
+    let original_uid = metadata.uid();
+    let original_gid = metadata.gid();
+    determine_target_file_ownership(original_uid, original_gid, uid, gid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

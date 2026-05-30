@@ -44,9 +44,33 @@ impl CompositeCache {
     /// For directories, recursively hashes all files.
     /// For regular files, hashes the file content.
     /// Skips files that don't exist or can't be read.
+    /// If a FileContext is provided, skips files excluded by .dockerignore.
     ///
     /// Analogous to Go: `CompositeCache.AddPath(p, context)`.
     pub fn add_path(&mut self, path: &str) -> std::io::Result<()> {
+        self.add_path_with_context(path, None)
+    }
+
+    /// Add a file path's content hash to the composite key, with .dockerignore exclusion.
+    ///
+    /// If `file_context` is provided and the path is excluded by .dockerignore,
+    /// the path is skipped (not added to the key). This matches Go's behavior
+    /// where `compositeKey.AddPath(f, s.fileContext)` excludes .dockerignore files.
+    ///
+    /// Analogous to Go: `CompositeCache.AddPath(p, context)`.
+    pub fn add_path_with_context(
+        &mut self,
+        path: &str,
+        file_context: Option<&kaniko_snapshot::FileContext>,
+    ) -> std::io::Result<()> {
+        // Check .dockerignore exclusion if FileContext is provided
+        if let Some(ctx) = file_context {
+            if ctx.excludes_file(path) {
+                tracing::debug!("{} found in .dockerignore, skipping from cache key", path);
+                return Ok(());
+            }
+        }
+
         let p = PathBuf::from(path);
         if !p.exists() {
             return Ok(());

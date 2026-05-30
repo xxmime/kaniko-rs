@@ -35,6 +35,7 @@ pub use fs_util::{
     mkdir_all_with_permissions, set_file_permissions, set_file_times,
     filepath_has_prefix, check_cleaned_path_against_ignore_list, eval_symlink,
     FileContext, new_file_context_from_dockerfile,
+    determine_target_file_ownership, copy_dir_with_exclude, copy_file_with_exclude,
 };
 pub use container::{
     ContainerRuntime, get_container_runtime, is_running_in_container,
