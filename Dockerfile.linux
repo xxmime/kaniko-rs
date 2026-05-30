@@ -1,7 +1,5 @@
-# Use Ubuntu as base image to build Linux version
 FROM ubuntu:22.04
 
-# Install necessary dependencies
 RUN apt-get update && apt-get install -y \
     curl \
     build-essential \
@@ -9,23 +7,16 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     ca-certificates
 
-# Install Rust
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Set working directory
 WORKDIR /app
 
-# Copy project files
 COPY . .
 
-# Build Linux version
 RUN cargo build --release
 
-# Extract binary file
 RUN cp target/release/kaniko-cli /kaniko-cli-linux-amd64
 
-# Final stage - only include binary file
 FROM scratch
 COPY --from=0 /kaniko-cli-linux-amd64 /kaniko-cli
 ENTRYPOINT ["/kaniko-cli"]

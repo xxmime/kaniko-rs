@@ -132,7 +132,7 @@ pub fn substitute_vars(input: &str, ctx: &VarContext) -> String {
                         result.push_str(&val);
                     } else {
                         // Variable not found - leave as-is
-                        result.push_str(&input[i..=i + start + end]);
+                        result.push_str(&input[i..=start + end]);
                     }
                     i = start + end + 1;
                 } else {
