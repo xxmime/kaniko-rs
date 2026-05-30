@@ -12,6 +12,7 @@ pub mod fs_util;
 pub mod container;
 pub mod command_util;
 pub mod tar_util;
+pub mod resolve;
 
 pub use ignore_list::{
     IgnoreListEntry, KANIKO_DIR,
@@ -43,4 +44,7 @@ pub use command_util::{
 pub use tar_util::{
     TarWriter, create_tarball_of_directory, tar_path_from_root,
     is_file_local_tar_archive, unpack_local_tar_archive, unpack_compressed_tar,
+};
+pub use resolve::{
+    resolve_paths, files_with_parent_dirs, resolve_symlink_ancestor,
 };
