@@ -353,10 +353,65 @@ impl Snapshotter {
     }
 
     /// Detect deleted files since last snapshot.
+    /// Uses remove_obsolete_whiteouts to filter out whiteouts whose parent dir
+    /// was also deleted (they would be redundant).
     fn detect_deleted_files(&self, _current: &[PathBuf]) -> Result<Vec<WhiteoutEntry>> {
         let deleted = self.layered_map.get_deleted_files();
-        Ok(deleted.iter().map(|p| WhiteoutEntry::regular(p)).collect())
+        let deleted_set: std::collections::HashSet<PathBuf> = deleted.iter().cloned().collect();
+        let filtered = remove_obsolete_whiteouts(&deleted_set);
+        Ok(filtered.iter().map(|p| WhiteoutEntry::regular(p)).collect())
     }
+}
+
+/// Filter deleted files: only include a whiteout if its parent directory was NOT also deleted.
+/// If a parent directory is deleted, the child whiteout is redundant because the parent
+/// whiteout already covers it.
+/// Analogous to Go: `snapshot.removeObsoleteWhiteouts`.
+pub fn remove_obsolete_whiteouts(deleted_files: &std::collections::HashSet<PathBuf>) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    for path in deleted_files {
+        let parent = path.parent();
+        let parent_deleted = parent.map_or(false, |p| deleted_files.contains(p));
+        if !parent_deleted {
+            tracing::trace!("Adding whiteout for {}", path.display());
+            result.push(path.clone());
+        }
+    }
+    result
+}
+
+/// Returns true if a parent of the given path has been replaced with anything other than a directory.
+/// This is used to skip whiteout entries when a parent directory was replaced by a file or symlink,
+/// because the whiteout would be invalid in that case.
+/// Analogous to Go: `snapshot.parentPathIncludesNonDirectory`.
+pub fn parent_path_includes_non_directory(path: &Path) -> std::io::Result<bool> {
+    for parent in parent_directories(path) {
+        let metadata = std::fs::symlink_metadata(&parent)?;
+        if !metadata.is_dir() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Return all parent directories of a path, from root to the immediate parent.
+/// E.g., /some/temp/dir -> [/, /some, /some/temp]
+/// Analogous to Go: `util.ParentDirectories`.
+pub fn parent_directories(path: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut current = path;
+
+    while let Some(parent) = current.parent() {
+        if parent.as_os_str().is_empty() || parent == Path::new("/") {
+            break;
+        }
+        if !paths.contains(&parent.to_path_buf()) {
+            paths.insert(0, parent.to_path_buf());
+        }
+        current = parent;
+    }
+
+    paths
 }
 
 #[cfg(test)]
@@ -411,5 +466,42 @@ mod tests {
         let files = vec![temp_dir.path().join("test.txt")];
         let result = snapshotter.take_snapshot_with_sync(&files, false, false);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_remove_obsolete_whiteouts() {
+        // If both parent and child are deleted, only parent whiteout is needed
+        let mut deleted: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        deleted.insert(PathBuf::from("/usr/local/bin/app"));
+        deleted.insert(PathBuf::from("/usr/local/bin"));
+        deleted.insert(PathBuf::from("/etc/config"));
+
+        let result = remove_obsolete_whiteouts(&deleted);
+        // /usr/local/bin should be included (parent /usr/local not deleted)
+        // /usr/local/bin/app should NOT be included (parent /usr/local/bin is deleted)
+        // /etc/config should be included (parent /etc not deleted)
+        assert!(result.contains(&PathBuf::from("/usr/local/bin")));
+        assert!(!result.contains(&PathBuf::from("/usr/local/bin/app")));
+        assert!(result.contains(&PathBuf::from("/etc/config")));
+    }
+
+    #[test]
+    fn test_parent_directories() {
+        let path = PathBuf::from("/some/temp/dir");
+        let parents = parent_directories(&path);
+        assert_eq!(parents, vec![
+            PathBuf::from("/some"),
+            PathBuf::from("/some/temp"),
+        ]);
+    }
+
+    #[test]
+    fn test_parent_path_includes_non_directory() {
+        // Test with a simple path - parent directories are all directories
+        // Use a path that doesn't include macOS /tmp symlink issues
+        let result = parent_path_includes_non_directory(Path::new("/usr/bin/ls"));
+        assert!(result.is_ok());
+        // /usr and /usr/bin are directories, so this should be false
+        assert!(!result.unwrap());
     }
 }

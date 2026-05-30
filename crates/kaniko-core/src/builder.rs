@@ -991,6 +991,18 @@ impl DockerCommand for CachedCommand {
         false
     }
 
+    fn cache_command(&self, _cached_image: &oci_image::mutate::MutableImage) -> Option<Box<dyn crate::command::DockerCommand>> {
+        None
+    }
+
+    fn files_used_from_context(
+        &self,
+        _config: &oci_image::config::ContainerConfig,
+        _args: &BuildArgs,
+    ) -> crate::command::Result<Vec<std::path::PathBuf>> {
+        Ok(vec![])
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

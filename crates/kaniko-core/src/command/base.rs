@@ -52,6 +52,22 @@ pub trait BaseCommand: Send + Sync + std::fmt::Debug {
     fn provides_files_to_snapshot_impl(&self) -> bool {
         self.metadata_only_impl()
     }
+
+    /// Files used from the build context.
+    /// Analogous to Go: `DockerCommand.FilesUsedFromContext`.
+    fn files_used_from_context_impl(
+        &self,
+        _config: &ContainerConfig,
+        _args: &BuildArgs,
+    ) -> Result<Vec<PathBuf>> {
+        Ok(vec![])
+    }
+
+    /// Return a cache-aware implementation of this command, if available.
+    /// Analogous to Go: `DockerCommand.CacheCommand`.
+    fn cache_command_impl(&self, _cached_image: &MutableImage) -> Option<Box<dyn DockerCommand>> {
+        None
+    }
 }
 
 /// Blanket implementation of DockerCommand for any type implementing BaseCommand.
@@ -73,16 +89,16 @@ impl<T: BaseCommand + 'static> DockerCommand for T {
         self.provides_files_to_snapshot_impl()
     }
 
-    fn cache_command(&self, _cached_image: &MutableImage) -> Option<Box<dyn DockerCommand>> {
-        None
+    fn cache_command(&self, cached_image: &MutableImage) -> Option<Box<dyn DockerCommand>> {
+        self.cache_command_impl(cached_image)
     }
 
     fn files_used_from_context(
         &self,
-        _config: &ContainerConfig,
-        _args: &BuildArgs,
+        config: &ContainerConfig,
+        args: &BuildArgs,
     ) -> Result<Vec<PathBuf>> {
-        Ok(vec![])
+        self.files_used_from_context_impl(config, args)
     }
 
     fn metadata_only(&self) -> bool {

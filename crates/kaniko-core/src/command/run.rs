@@ -205,6 +205,16 @@ impl BaseCommand for RunCommand {
     fn should_detect_deleted_files_impl(&self) -> bool { true }
     fn is_args_envs_required_in_cache_impl(&self) -> bool { true }
     fn provides_files_to_snapshot_impl(&self) -> bool { false }
+
+    /// Return a cache-aware RUN command implementation.
+    /// Analogous to Go: `RunCommand.CacheCommand(img) -> CachingRunCommand`.
+    fn cache_command_impl(&self, cached_image: &oci_image::mutate::MutableImage) -> Option<Box<dyn crate::command::DockerCommand>> {
+        let command_str = self.command_string_impl();
+        Some(Box::new(crate::command::CachingRunCommand::new(
+            cached_image.clone(),
+            command_str,
+        )))
+    }
 }
 
 /// Parsed user credentials (uid, gid).

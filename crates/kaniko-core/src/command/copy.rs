@@ -287,7 +287,7 @@ impl BaseCommand for CopyCommand {
     }
 
     fn requires_unpacked_fs_impl(&self) -> bool {
-        false
+        true
     }
 
     fn should_cache_output_impl(&self) -> bool {
@@ -301,6 +301,39 @@ impl BaseCommand for CopyCommand {
     fn files_to_snapshot_impl(&self) -> Option<Vec<PathBuf>> {
         let files = self.snapshot_files.lock().unwrap();
         if files.is_empty() { None } else { Some(files.clone()) }
+    }
+
+    /// Files used from the build context for cache key computation.
+    /// Analogous to Go: `CopyCommand.FilesUsedFromContext` / `copyCmdFilesUsedFromContext`.
+    fn files_used_from_context_impl(
+        &self,
+        _config: &ContainerConfig,
+        _args: &BuildArgs,
+    ) -> Result<Vec<PathBuf>> {
+        // If --from is specified, use the kaniko stage directory instead of build context
+        let ctx_dir = if let Some(ref from_stage) = self.from {
+            // Analogous to Go: `fileContext = util.FileContext{Root: filepath.Join(kConfig.KanikoDir, cmd.From)}`
+            PathBuf::from(format!("/kaniko/stages/{}/", from_stage))
+        } else {
+            self.context_dir.clone()
+        };
+
+        let mut files = Vec::new();
+        for src in &self.sources {
+            let full_path = ctx_dir.join(src);
+            files.push(full_path);
+        }
+        Ok(files)
+    }
+
+    /// Return a cache-aware COPY command implementation.
+    /// Analogous to Go: `CopyCommand.CacheCommand(img) -> CachingCopyCommand`.
+    fn cache_command_impl(&self, cached_image: &oci_image::mutate::MutableImage) -> Option<Box<dyn crate::command::DockerCommand>> {
+        let command_str = self.command_string_impl();
+        Some(Box::new(crate::command::CachingCopyCommand::new(
+            cached_image.clone(),
+            command_str,
+        )))
     }
 }
 
@@ -609,7 +642,7 @@ mod tests {
         );
         
         assert!(!command.metadata_only_impl());
-        assert!(!command.requires_unpacked_fs_impl());
+        assert!(command.requires_unpacked_fs_impl());
         assert!(command.should_cache_output_impl());
         assert!(command.provides_files_to_snapshot_impl());
         assert!(command.files_to_snapshot_impl().is_none()); // Empty initially

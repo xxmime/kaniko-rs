@@ -131,13 +131,37 @@ impl BaseCommand for AddCommand {
     }
 
     fn metadata_only_impl(&self) -> bool { false }
-    fn requires_unpacked_fs_impl(&self) -> bool { false }
+    fn requires_unpacked_fs_impl(&self) -> bool { true }
     fn should_cache_output_impl(&self) -> bool { self.should_cache }
     fn provides_files_to_snapshot_impl(&self) -> bool { true }
 
     fn files_to_snapshot_impl(&self) -> Option<Vec<PathBuf>> {
         let files = self.snapshot_files.lock().unwrap();
         if files.is_empty() { None } else { Some(files.clone()) }
+    }
+
+    /// Files used from the build context for cache key computation.
+    /// Analogous to Go: `AddCommand.FilesUsedFromContext`.
+    /// Skips remote URLs and tar archives (they don't come from build context).
+    fn files_used_from_context_impl(
+        &self,
+        _config: &ContainerConfig,
+        _args: &BuildArgs,
+    ) -> Result<Vec<PathBuf>> {
+        let mut files = Vec::new();
+        for src in &self.sources {
+            // Skip remote URLs
+            if src.starts_with("http://") || src.starts_with("https://") {
+                continue;
+            }
+            // Skip tar archives (they get auto-extracted, not copied as context files)
+            if src.ends_with(".tar") || src.ends_with(".tar.gz") || src.ends_with(".tgz") {
+                continue;
+            }
+            let full_path = self.context_dir.join(src);
+            files.push(full_path);
+        }
+        Ok(files)
     }
 }
 

@@ -274,6 +274,16 @@ impl BaseCommand for RunMarkerCommand {
             Some(files.clone())
         }
     }
+
+    /// Return a cache-aware RUN marker command implementation.
+    /// Analogous to Go: `RunMarkerCommand.CacheCommand(img) -> CachingRunCommand`.
+    fn cache_command_impl(&self, cached_image: &oci_image::mutate::MutableImage) -> Option<Box<dyn crate::command::DockerCommand>> {
+        let command_str = self.command_string_impl();
+        Some(Box::new(crate::command::CachingRunCommand::new(
+            cached_image.clone(),
+            command_str,
+        )))
+    }
 }
 
 #[cfg(test)]

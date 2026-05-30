@@ -45,6 +45,7 @@ pub use command_util::{
     get_user_group, get_chmod,
     DO_NOT_CHANGE_UID, DO_NOT_CHANGE_GID,
     update_config_env, docker_conf_location,
+    resolve_env_and_wildcards,
 };
 pub use tar_util::{
     TarWriter, create_tarball_of_directory, tar_path_from_root,

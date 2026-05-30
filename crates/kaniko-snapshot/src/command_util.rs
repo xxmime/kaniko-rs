@@ -413,6 +413,41 @@ pub fn docker_conf_location() -> String {
 }
 fn simple_regex_lazy() -> &'static Regex { &SIMPLE_RE }
 
+/// Resolve environment variables and wildcards in COPY/ADD sources and destination.
+///
+/// This is the main entry point for source resolution in Dockerfile commands.
+/// It resolves env vars, expands wildcards, and validates sources.
+///
+/// Returns (resolved_sources, resolved_destination).
+///
+/// Analogous to Go: `ResolveEnvAndWildcards()`.
+pub fn resolve_env_and_wildcards(
+    sources: &[String],
+    dest: &str,
+    context_root: &str,
+    envs: &[String],
+) -> Result<(Vec<String>, String), String> {
+    // First, resolve environment variables in sources
+    let resolved_envs = resolve_environment_replacement_list(sources, envs, true)?;
+    if resolved_envs.is_empty() {
+        return Err("resolved envs is empty".to_string());
+    }
+
+    // Resolve environment variables in destination
+    let resolved_dests = resolve_environment_replacement_list(&[dest.to_string()], envs, true)?;
+    let resolved_dest = resolved_dests[0].clone();
+
+    // Resolve wildcards and get a list of resolved sources
+    let root_path = Path::new(context_root);
+    let resolved_sources = crate::fs_util::resolve_sources(&resolved_envs, root_path)
+        .map_err(|e| format!("resolving sources: {}", e))?;
+
+    // Validate sources
+    is_srcs_valid(sources, &resolved_dest, &resolved_sources, context_root, &|_| false)?;
+
+    Ok((resolved_sources, resolved_dest))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

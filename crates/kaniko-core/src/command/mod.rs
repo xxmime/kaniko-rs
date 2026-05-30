@@ -62,18 +62,14 @@ pub trait DockerCommand: Send + Sync + fmt::Debug {
     fn provides_files_to_snapshot(&self) -> bool;
 
     /// Return a cache-aware implementation of this command, if available.
-    fn cache_command(&self, _cached_image: &MutableImage) -> Option<Box<dyn DockerCommand>> {
-        None
-    }
+    fn cache_command(&self, cached_image: &MutableImage) -> Option<Box<dyn DockerCommand>>;
 
     /// Files used from the build context.
     fn files_used_from_context(
         &self,
-        _config: &ContainerConfig,
-        _args: &BuildArgs,
-    ) -> Result<Vec<PathBuf>> {
-        Ok(vec![])
-    }
+        config: &ContainerConfig,
+        args: &BuildArgs,
+    ) -> Result<Vec<PathBuf>>;
 
     /// Whether this command only modifies metadata (no filesystem changes).
     fn metadata_only(&self) -> bool;
@@ -145,3 +141,139 @@ pub use shell::ShellCommand;
 pub use stopsignal::StopSignalCommand;
 pub use healthcheck::HealthCheckCommand;
 pub use onbuild::OnBuildCommand;
+
+/// Create a DockerCommand from a parsed Dockerfile instruction.
+///
+/// This is the main factory function for creating command objects from
+/// the parser's instruction types. It maps each instruction variant
+/// to its corresponding DockerCommand implementation.
+///
+/// Analogous to Go: `commands.GetCommand()`.
+pub fn get_command(
+    instruction: &dockerfile_parser::instruction::Instruction,
+    context_dir: std::path::PathBuf,
+    cache_copy: bool,
+    cache_run: bool,
+) -> Result<Box<dyn DockerCommand>> {
+    use dockerfile_parser::instruction::Instruction;
+
+    match instruction {
+        Instruction::Run(run_inst) => {
+            let cmd = if run_inst.is_shell_form {
+                RunCommand::new_shell(run_inst.command.clone(), cache_run)
+            } else {
+                RunCommand::new_exec(run_inst.args.clone(), cache_run)
+            };
+            let mut cmd = cmd;
+            for mount in &run_inst.mounts {
+                cmd = cmd.with_mount(mount.clone());
+            }
+            if let Some(ref network) = run_inst.network {
+                cmd = cmd.with_network(network.clone());
+            }
+            Ok(Box::new(cmd))
+        }
+        Instruction::Copy(copy_inst) => {
+            let cmd = CopyCommand::with_flags(
+                copy_inst.sources.clone(),
+                copy_inst.destination.clone(),
+                copy_inst.from.clone(),
+                copy_inst.chown.clone(),
+                copy_inst.chmod.clone(),
+                copy_inst.link,
+                context_dir,
+                cache_copy,
+            );
+            Ok(Box::new(cmd))
+        }
+        Instruction::Add(add_inst) => {
+            let cmd = AddCommand::with_flags(
+                add_inst.sources.clone(),
+                add_inst.destination.clone(),
+                add_inst.chown.clone(),
+                add_inst.chmod.clone(),
+                add_inst.link,
+                context_dir,
+                cache_copy,
+            );
+            Ok(Box::new(cmd))
+        }
+        Instruction::Env(env_inst) => {
+            Ok(Box::new(EnvCommand::new(env_inst.key.clone(), env_inst.value.clone())))
+        }
+        Instruction::Label(label_inst) => {
+            Ok(Box::new(LabelCommand::new(label_inst.labels.clone())))
+        }
+        Instruction::Expose(expose_inst) => {
+            Ok(Box::new(ExposeCommand::new(expose_inst.ports.clone())))
+        }
+        Instruction::User(user_inst) => {
+            Ok(Box::new(UserCommand::new(user_inst.user.clone())))
+        }
+        Instruction::Workdir(workdir_inst) => {
+            Ok(Box::new(WorkdirCommand::new(workdir_inst.path.clone())))
+        }
+        Instruction::Cmd(cmd_inst) => {
+            if cmd_inst.is_shell_form {
+                Ok(Box::new(CmdCommand::new_shell(cmd_inst.command.first().cloned().unwrap_or_default())))
+            } else {
+                Ok(Box::new(CmdCommand::new_exec(cmd_inst.command.clone())))
+            }
+        }
+        Instruction::Entrypoint(ep_inst) => {
+            if ep_inst.is_shell_form {
+                Ok(Box::new(EntrypointCommand::new_shell(ep_inst.command.first().cloned().unwrap_or_default())))
+            } else {
+                Ok(Box::new(EntrypointCommand::new_exec(ep_inst.command.clone())))
+            }
+        }
+        Instruction::Volume(vol_inst) => {
+            Ok(Box::new(VolumeCommand::new(vol_inst.paths.clone())))
+        }
+        Instruction::Arg(arg_inst) => {
+            Ok(Box::new(ArgCommand::new(arg_inst.name.clone(), arg_inst.default_value.clone())))
+        }
+        Instruction::Shell(shell_inst) => {
+            Ok(Box::new(ShellCommand::new(shell_inst.shell.clone())))
+        }
+        Instruction::StopSignal(ss_inst) => {
+            Ok(Box::new(StopSignalCommand::new(ss_inst.signal.clone())))
+        }
+        Instruction::Healthcheck(hc_inst) => {
+            if hc_inst.is_none {
+                Ok(Box::new(HealthCheckCommand::none()))
+            } else {
+                let test = hc_inst.cmd.as_ref()
+                    .map(|c| vec![c.clone()])
+                    .unwrap_or_default();
+                Ok(Box::new(HealthCheckCommand::new(
+                    test,
+                    hc_inst.interval.clone(),
+                    hc_inst.timeout.clone(),
+                    hc_inst.start_period.clone(),
+                    hc_inst.retries,
+                )))
+            }
+        }
+        Instruction::Onbuild(ob_inst) => {
+            // ONBUILD stores the trigger as a string representation of the inner instruction
+            let inner_cmd = get_command(&ob_inst.instruction, context_dir, cache_copy, cache_run);
+            let trigger = match inner_cmd {
+                Ok(cmd) => cmd.command_string(),
+                Err(_) => format!("{:?}", ob_inst.instruction),
+            };
+            Ok(Box::new(OnBuildCommand::new(trigger)))
+        }
+        Instruction::Maintainer(m_inst) => {
+            // MAINTAINER is deprecated, skip with a warning
+            tracing::warn!("MAINTAINER is deprecated, skipping: {}", m_inst.name);
+            Err(CommandError::Failed(format!("MAINTAINER is deprecated: {}", m_inst.name)))
+        }
+        Instruction::From(_) => {
+            Err(CommandError::Failed("FROM instruction should not be converted to a command".to_string()))
+        }
+        Instruction::Comment(_) => {
+            Err(CommandError::Failed("Comment should not be converted to a command".to_string()))
+        }
+    }
+}
