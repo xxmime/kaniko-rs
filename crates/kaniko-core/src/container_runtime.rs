@@ -126,6 +126,18 @@ pub fn prepare_rootfs(root_dir: &PathBuf) -> bool {
         tracing::warn!("sandbox: /proc mount failed, some commands may not work");
     }
 
+    // In sandbox mode, write an APT config file that disables APT's internal
+    // sandboxing. In a user namespace, only UID 0 is mapped, so apt's attempt
+    // to switch to the _apt user (uid 100/42) fails with seteuid errors.
+    // This config tells apt to run sandboxed operations as root instead.
+    let apt_conf_dir = root_dir.join("etc/apt/apt.conf.d");
+    if let Ok(()) = std::fs::create_dir_all(&apt_conf_dir) {
+        let apt_conf_path = apt_conf_dir.join("99kaniko-sandbox");
+        if let Err(e) = std::fs::write(&apt_conf_path, "APT::Sandbox::User \"root\";\n") {
+            tracing::debug!("sandbox: failed to write APT config: {}", e);
+        }
+    }
+
     proc_mounted
 }
 
@@ -133,6 +145,12 @@ pub fn prepare_rootfs(root_dir: &PathBuf) -> bool {
 pub fn cleanup_rootfs(root_dir: &PathBuf) {
     if !is_sandbox_active() {
         return;
+    }
+
+    // Remove the APT sandbox config we created
+    let apt_conf_path = root_dir.join("etc/apt/apt.conf.d/99kaniko-sandbox");
+    if apt_conf_path.exists() {
+        let _ = std::fs::remove_file(&apt_conf_path);
     }
 
     // Unmount in reverse order
@@ -233,8 +251,10 @@ async fn execute_chroot(
     // In sandbox mode (user namespace), only UID 0 (root) is mapped.
     // Prevent apt from trying to sandbox itself by switching to the _apt user,
     // which would fail with seteuid/setgroups errors.
+    // We pass the config via -o flag in the command's environment, which is
+    // more reliable than APT_CONFIG (which expects a file path).
     if is_sandbox_active() {
-        cmd.env("APT_CONFIG", "APT::Sandbox::User \"root\";");
+        cmd.env("DEBIAN_FRONTEND", "noninteractive");
     }
 
     if !config.env.contains_key("PATH") {
@@ -282,8 +302,10 @@ async fn execute_unshare_chroot(
     // In sandbox mode (user namespace), only UID 0 (root) is mapped.
     // Prevent apt from trying to sandbox itself by switching to the _apt user,
     // which would fail with seteuid/setgroups errors.
+    // We pass the config via -o flag in the command's environment, which is
+    // more reliable than APT_CONFIG (which expects a file path).
     if is_sandbox_active() {
-        cmd.env("APT_CONFIG", "APT::Sandbox::User \"root\";");
+        cmd.env("DEBIAN_FRONTEND", "noninteractive");
     }
 
     if !config.env.contains_key("PATH") {

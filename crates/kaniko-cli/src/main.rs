@@ -1137,34 +1137,40 @@ fn set_dummy_destinations(cli: &mut Cli) {
 /// `KANIKO_SANDBOX_USERNS=1`). It performs setup that is required for
 /// commands inside chroot to work correctly:
 ///
-/// 1. `mount --make-rprivate /` — Mark the mount tree as private so that
-///    new mounts (proc, sys, dev) don't propagate to the parent namespace
-///    and are allowed by the kernel.
+/// 1. `mount --make-rslave /` — Mark the mount tree as slave so that
+///    mount events from the parent namespace propagate in, but our mounts
+///    don't propagate out. This is required before we can mount /proc,
+///    /sys, /dev into the rootfs. (Matches Go: chrootarchive uses
+///    `mount.MakeRSlave("/")` before pivot_root.)
 ///
-/// 2. Write "allow" to `/proc/self/setgroups` — New user namespaces deny
-///    setgroups by default. Allowing it enables programs like apt to switch
-///    to auxiliary groups.
+/// 2. Write "allow" to `/proc/self/setgroups` — `unshare --map-root-user`
+///    sets this to "deny", but chrooted programs (apt, dpkg) need to call
+///    setgroups. Writing "allow" re-enables it.
 #[cfg(target_os = "linux")]
 fn init_user_namespace() {
-    // 1. Make mount tree private — required before mounting proc/sys/dev
+    // 1. Make mount tree slave — required before mounting proc/sys/dev.
+    // Using rslave (recursive) so all existing shared mounts become slave.
+    // This matches the Go chrootarchive implementation.
     let output = std::process::Command::new("mount")
-        .arg("--make-rprivate")
+        .arg("--make-rslave")
         .arg("/")
         .output();
     match output {
         Ok(o) if o.status.success() => {
-            tracing::debug!("sandbox: mount --make-rprivate / succeeded");
+            tracing::debug!("sandbox: mount --make-rslave / succeeded");
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            tracing::warn!("sandbox: mount --make-rprivate / failed: {}", stderr.trim());
+            tracing::warn!("sandbox: mount --make-rslave / failed: {}", stderr.trim());
         }
         Err(e) => {
-            tracing::warn!("sandbox: mount --make-rprivate / error: {}", e);
+            tracing::warn!("sandbox: mount --make-rslave / error: {}", e);
         }
     }
 
-    // 2. Allow setgroups in the user namespace
+    // 2. Allow setgroups in the user namespace.
+    // unshare --map-root-user writes "deny" to /proc/self/setgroups,
+    // but programs like apt need to switch groups.
     let setgroups_path = "/proc/self/setgroups";
     if std::path::Path::new(setgroups_path).exists() {
         match std::fs::write(setgroups_path, "allow") {
@@ -1217,6 +1223,8 @@ fn apply_sandbox(sandbox: bool) {
         let mut cmd = std::process::Command::new("unshare");
         cmd.arg("--user")
             .arg("--mount")
+            .arg("--propagation")
+            .arg("slave")
             .arg("--fork")
             .arg("--map-root-user")
             .arg("--")
