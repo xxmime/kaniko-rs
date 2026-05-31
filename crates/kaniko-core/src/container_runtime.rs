@@ -187,13 +187,20 @@ pub async fn execute_in_container(
     if use_chroot && is_sandbox_active() {
         // Sandbox path: prepare rootfs, then chroot directly
         // (we're already in the user namespace from apply_sandbox)
-        let _rootfs_ready = prepare_rootfs(&config.root_dir);
+        let proc_mounted = prepare_rootfs(&config.root_dir);
 
-        // Always try chroot — many commands work even without /proc mounted
-        let result = execute_chroot(program, args, config).await;
-
-        cleanup_rootfs(&config.root_dir);
-        result
+        if proc_mounted {
+            // /proc mounted successfully — chroot is safe
+            let result = execute_chroot(program, args, config).await;
+            cleanup_rootfs(&config.root_dir);
+            result
+        } else {
+            // /proc not available — chroot would leave the environment
+            // without /proc which breaks most commands (e.g. apt, ps, etc.)
+            // Fall back to direct execution on the host
+            tracing::warn!("sandbox: /proc mount failed, skipping chroot and running directly");
+            execute_direct(program, args, config).await
+        }
     } else if use_chroot {
         // Non-sandbox path: use unshare+chroot
         let result = execute_unshare_chroot(program, args, config).await;
@@ -223,7 +230,7 @@ async fn execute_chroot(
         cmd.arg("-c");
         cmd.arg(&format_command(program, args));
     } else {
-        cmd.arg("--").arg(program).args(args);
+        cmd.arg(program).args(args);
     }
 
     cmd.envs(&config.env);
@@ -266,7 +273,7 @@ async fn execute_unshare_chroot(
         cmd.arg("su").arg("-").arg(user);
     }
 
-    cmd.arg("--").arg(program).args(args);
+    cmd.arg(program).args(args);
 
     cmd.envs(&config.env);
 
