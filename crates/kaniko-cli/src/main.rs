@@ -1131,6 +1131,53 @@ fn set_dummy_destinations(cli: &mut Cli) {
     }
 }
 
+/// Initialize the user namespace for container builds.
+///
+/// This must be called after entering the user namespace (detected via
+/// `KANIKO_SANDBOX_USERNS=1`). It performs setup that is required for
+/// commands inside chroot to work correctly:
+///
+/// 1. `mount --make-rprivate /` — Mark the mount tree as private so that
+///    new mounts (proc, sys, dev) don't propagate to the parent namespace
+///    and are allowed by the kernel.
+///
+/// 2. Write "allow" to `/proc/self/setgroups` — New user namespaces deny
+///    setgroups by default. Allowing it enables programs like apt to switch
+///    to auxiliary groups.
+#[cfg(target_os = "linux")]
+fn init_user_namespace() {
+    // 1. Make mount tree private — required before mounting proc/sys/dev
+    let output = std::process::Command::new("mount")
+        .arg("--make-rprivate")
+        .arg("/")
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            tracing::debug!("sandbox: mount --make-rprivate / succeeded");
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            tracing::warn!("sandbox: mount --make-rprivate / failed: {}", stderr.trim());
+        }
+        Err(e) => {
+            tracing::warn!("sandbox: mount --make-rprivate / error: {}", e);
+        }
+    }
+
+    // 2. Allow setgroups in the user namespace
+    let setgroups_path = "/proc/self/setgroups";
+    if std::path::Path::new(setgroups_path).exists() {
+        match std::fs::write(setgroups_path, "allow") {
+            Ok(()) => {
+                tracing::debug!("sandbox: setgroups allowed");
+            }
+            Err(e) => {
+                tracing::debug!("sandbox: could not write 'allow' to {}: {}", setgroups_path, e);
+            }
+        }
+    }
+}
+
 /// Apply sandbox mode for the build.
 ///
 /// In sandbox mode, the build filesystem is isolated using Linux namespaces.
@@ -1148,6 +1195,11 @@ fn apply_sandbox(sandbox: bool) {
         if std::env::var("KANIKO_SANDBOX_USERNS").as_deref() == Ok("1") {
             tracing::info!("Sandbox: already running inside user namespace");
             kaniko_core::container_runtime::set_sandbox_active(true);
+
+            // Initialize the user namespace for container builds:
+            // 1. Make mount tree private so we can create new mounts
+            // 2. Allow setgroups (needed for apt, etc.)
+            init_user_namespace();
             return;
         }
 

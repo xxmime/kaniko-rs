@@ -187,20 +187,15 @@ pub async fn execute_in_container(
     if use_chroot && is_sandbox_active() {
         // Sandbox path: prepare rootfs, then chroot directly
         // (we're already in the user namespace from apply_sandbox)
-        let proc_mounted = prepare_rootfs(&config.root_dir);
+        let _proc_mounted = prepare_rootfs(&config.root_dir);
 
-        if proc_mounted {
-            // /proc mounted successfully — chroot is safe
-            let result = execute_chroot(program, args, config).await;
-            cleanup_rootfs(&config.root_dir);
-            result
-        } else {
-            // /proc not available — chroot would leave the environment
-            // without /proc which breaks most commands (e.g. apt, ps, etc.)
-            // Fall back to direct execution on the host
-            tracing::warn!("sandbox: /proc mount failed, skipping chroot and running directly");
-            execute_direct(program, args, config).await
-        }
+        // Always chroot — the build MUST run inside the container rootfs.
+        // Even without /proc mounted, many commands still work.
+        // Commands that need /proc will produce warnings but can often
+        // continue (e.g. apt with APT::Sandbox::User=root).
+        let result = execute_chroot(program, args, config).await;
+        cleanup_rootfs(&config.root_dir);
+        result
     } else if use_chroot {
         // Non-sandbox path: use unshare+chroot
         let result = execute_unshare_chroot(program, args, config).await;
@@ -234,6 +229,13 @@ async fn execute_chroot(
     }
 
     cmd.envs(&config.env);
+
+    // In sandbox mode (user namespace), only UID 0 (root) is mapped.
+    // Prevent apt from trying to sandbox itself by switching to the _apt user,
+    // which would fail with seteuid/setgroups errors.
+    if is_sandbox_active() {
+        cmd.env("APT_CONFIG", "APT::Sandbox::User \"root\";");
+    }
 
     if !config.env.contains_key("PATH") {
         cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
@@ -276,6 +278,13 @@ async fn execute_unshare_chroot(
     cmd.arg(program).args(args);
 
     cmd.envs(&config.env);
+
+    // In sandbox mode (user namespace), only UID 0 (root) is mapped.
+    // Prevent apt from trying to sandbox itself by switching to the _apt user,
+    // which would fail with seteuid/setgroups errors.
+    if is_sandbox_active() {
+        cmd.env("APT_CONFIG", "APT::Sandbox::User \"root\";");
+    }
 
     if !config.env.contains_key("PATH") {
         cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
