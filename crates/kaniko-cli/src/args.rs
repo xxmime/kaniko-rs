@@ -40,7 +40,7 @@ pub struct Cli {
     pub dockerfile: Option<String>,
 
     /// Path to the build context directory.
-    #[arg(short, long, default_value = "/workspace/")]
+    #[arg(short, long, default_value = ".")]
     pub context: Option<String>,
 
     /// Sub path within the given context.
