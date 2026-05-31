@@ -200,8 +200,22 @@ impl SystemKeychain {
     }
 
     fn read_docker_config(&self) -> Result<DockerConfig> {
+        tracing::debug!("Looking for Docker config at: {}", self.docker_config_path.display());
+        if !self.docker_config_path.exists() {
+            tracing::warn!("Docker config not found at: {}", self.docker_config_path.display());
+            return Err(CredsError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Docker config not found at: {}", self.docker_config_path.display()),
+            )));
+        }
         let content = std::fs::read_to_string(&self.docker_config_path)?;
         let config: DockerConfig = serde_json::from_str(&content)?;
+        tracing::debug!(
+            "Docker config loaded: {} auths, {} credHelpers, credsStore={}",
+            config.auths.len(),
+            config.cred_helpers.len(),
+            config.creds_store.as_deref().unwrap_or("none"),
+        );
         Ok(config)
     }
 }

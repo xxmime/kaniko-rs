@@ -416,7 +416,10 @@ async fn do_build(
             MutableImage::empty()
         } else {
             tracing::info!("Pulling base image: {}", stage.image);
-            let registry = extract_registry(&stage.image);
+            // Use Reference::parse for registry — must match push/pull code
+            let pull_ref = oci_registry::Reference::parse(&stage.image)
+                .map_err(|e| format!("Invalid image reference {}: {}", stage.image, e))?;
+            let registry = pull_ref.registry.clone();
             let credential = keychain.credentials(&registry)
                 .unwrap_or_else(|e| {
                     tracing::debug!("Pull credential lookup for {}: {}", registry, e);
@@ -596,7 +599,10 @@ async fn do_push(
 
     for dest in &cli.destination {
         tracing::info!("Pushing image to {}", dest);
-        let registry = extract_registry(dest);
+        // Use Reference::parse to extract registry — must match the push code
+        let reference = oci_registry::Reference::parse(dest)
+            .map_err(|e| format!("Invalid destination {}: {}", dest, e))?;
+        let registry = reference.registry.clone();
         let insecure = cli.insecure
             || cli.insecure_registry.contains(&registry);
         let credential = keychain.credentials(&registry)
@@ -629,11 +635,16 @@ async fn do_push(
 // ============================================================================
 
 /// Extract registry hostname from an image reference.
+///
+/// Uses the same logic as `Reference::parse` to ensure consistency
+/// with the push/pull code. Returns "index.docker.io" for DockerHub
+/// short names (no dot, no colon, not localhost).
 fn extract_registry(reference: &str) -> String {
     if let Some((host, _)) = reference.split_once('/') {
         if host.contains('.') || host.contains(':') || host == "localhost" {
             host.to_string()
         } else {
+            // No dot/colon → DockerHub short name
             "index.docker.io".to_string()
         }
     } else {
@@ -1240,6 +1251,12 @@ fn apply_sandbox(sandbox: bool) {
 
         // Set env to indicate we're in sandbox namespace
         cmd.env("KANIKO_SANDBOX_USERNS", "1");
+
+        // Ensure HOME is set explicitly for credential lookup
+        // In user namespace, the effective UID is 0 but HOME might not be /root
+        if std::env::var("HOME").is_err() {
+            cmd.env("HOME", "/root");
+        }
 
         match cmd.status() {
             Ok(status) => {
