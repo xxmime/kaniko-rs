@@ -472,18 +472,34 @@ async fn authenticate(
 
     match resp {
         Ok(r) => {
+            let status = r.status();
             // Check for WWW-Authenticate header
             if let Some(www_auth) = r.headers().get("www-authenticate") {
                 let www_auth_str = www_auth.to_str().map_err(|_| PushError::Auth("invalid www-authenticate header".into()))?;
+                tracing::debug!("Registry requires auth (HTTP {}), WWW-Authenticate: {}", status, www_auth_str);
                 return obtain_bearer_token(client, www_auth_str, repository, auth).await;
+            }
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                // Got 401 but no WWW-Authenticate header — likely bad credentials
+                if auth.credential.is_anonymous() {
+                    tracing::warn!("Registry returned 401 Unauthorized — no credentials provided. \
+                                     Check your Docker config.json or use --docker-config flag.");
+                }
+                return Err(PushError::Auth(format!(
+                    "HTTP 401 Unauthorized — credentials may be invalid for registry {}",
+                    auth.registry
+                )));
             }
             // No auth required
             Ok(String::new())
         }
-        Err(_) => {
+        Err(e) => {
             // If we can't reach the registry without auth, try with credentials
             if auth.credential.username.is_empty() {
-                return Err(PushError::Auth("no credentials available".into()));
+                return Err(PushError::Auth(format!(
+                    "no credentials available for registry {}: {}",
+                    auth.registry, e
+                )));
             }
             // Basic auth
             Ok(format!(

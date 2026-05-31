@@ -418,7 +418,10 @@ async fn do_build(
             tracing::info!("Pulling base image: {}", stage.image);
             let registry = extract_registry(&stage.image);
             let credential = keychain.credentials(&registry)
-                .unwrap_or_else(|_| kaniko_creds::Credential::anonymous());
+                .unwrap_or_else(|e| {
+                    tracing::debug!("Pull credential lookup for {}: {}", registry, e);
+                    kaniko_creds::Credential::anonymous()
+                });
             let insecure = cli.insecure || cli.insecure_pull
                 || cli.insecure_registry.contains(&registry);
             let auth = RegistryAuth::new(&registry, credential)
@@ -597,7 +600,13 @@ async fn do_push(
         let insecure = cli.insecure
             || cli.insecure_registry.contains(&registry);
         let credential = keychain.credentials(&registry)
-            .unwrap_or_else(|_| kaniko_creds::Credential::anonymous());
+            .unwrap_or_else(|e| {
+                tracing::warn!("Credential lookup failed for {}: {}, using anonymous", registry, e);
+                kaniko_creds::Credential::anonymous()
+            });
+        if credential.is_anonymous() {
+            tracing::warn!("No credentials found for registry {}, pushing anonymously", registry);
+        }
         let auth = RegistryAuth::new(&registry, credential)
             .insecure(insecure);
 

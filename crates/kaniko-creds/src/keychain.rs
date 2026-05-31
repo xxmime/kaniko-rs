@@ -106,44 +106,53 @@ impl SystemKeychain {
     ///
     /// Checks multiple sources in order (analogous to Go: `GetKeychain()`
     /// with `authn.NewMultiKeychain`):
-    /// 1. Docker config auths entries
+    /// 1. Docker config auths entries (with key normalization)
     /// 2. Docker config credHelpers entries
     /// 3. Docker config credsStore (default credential store)
     /// 4. Cloud provider credential helpers (ECR, ACR, GitLab)
-    /// 5. Google cloud keychain (gcloud config)
-    /// 6. Anonymous
+    /// 5. Anonymous
     pub fn credentials(&self, registry: &str) -> Result<Credential> {
         let config = self.read_docker_config()?;
 
-        // 1. Check auths
-        if let Some(auth) = config.auths.get(registry) {
-            if let Some(encoded) = &auth.auth {
-                if let Some(cred) = decode_auth(encoded) {
-                    return Ok(cred);
+        // 1. Check auths — try multiple key variations matching Go's DefaultKeychain:
+        //    - registry as-is (e.g. "gcr.io")
+        //    - with https:// prefix (e.g. "https://gcr.io")
+        //    - with https:// and /v1/ suffix (e.g. "https://index.docker.io/v1/")
+        //    - DockerHub special case: "index.docker.io" -> "https://index.docker.io/v1/"
+        for key in registry_keys(registry) {
+            if let Some(auth) = config.auths.get(&key) {
+                if let Some(encoded) = &auth.auth {
+                    if let Some(cred) = decode_auth(encoded) {
+                        tracing::debug!("Found credentials in auths for key: {}", key);
+                        return Ok(cred);
+                    }
                 }
             }
         }
 
-        // 2. Check credential helpers
-        if let Some(helper) = config.cred_helpers.get(registry) {
-            return crate::helper::call_credential_helper(helper, registry);
+        // 2. Check credential helpers (also try key variations)
+        for key in registry_keys(registry) {
+            if let Some(helper) = config.cred_helpers.get(&key) {
+                tracing::debug!("Trying credential helper '{}' for key: {}", helper, key);
+                return crate::helper::call_credential_helper(helper, registry);
+            }
         }
 
         // 3. Check default credential store
         if let Some(store) = &config.creds_store {
+            tracing::debug!("Trying default credential store: {}", store);
             if let Ok(cred) = crate::helper::call_credential_helper(store, registry) {
                 return Ok(cred);
             }
         }
 
         // 4. Cloud provider credential helpers
-        //    Try each cloud-specific helper if the registry matches the pattern.
-        //    Analogous to Go: `authn.NewKeychainFromHelper(ecr.NewECRHelper(...))` etc.
         if let Some(cred) = self.try_cloud_helpers(registry) {
             return Ok(cred);
         }
 
         // 5. Anonymous
+        tracing::debug!("No credentials found for {}, using anonymous", registry);
         Ok(Credential::anonymous())
     }
 
@@ -248,6 +257,42 @@ fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/root"))
+}
+
+/// Generate possible Docker config.json key variations for a registry.
+///
+/// Docker config.json can store auth keys in multiple formats:
+/// - `gcr.io` (bare hostname)
+/// - `https://gcr.io` (with https prefix)
+/// - `https://index.docker.io/v1/` (DockerHub with /v1/ suffix)
+///
+/// This function generates all possible key variations to try when
+/// looking up credentials, matching Go's DefaultKeychain behavior.
+fn registry_keys(registry: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+
+    // 1. Registry as-is
+    keys.push(registry.to_string());
+
+    // 2. With https:// prefix
+    let with_https = format!("https://{}", registry);
+    keys.push(with_https.clone());
+
+    // 3. With https:// prefix and /v1/ suffix
+    keys.push(format!("{}/v1/", with_https));
+
+    // 4. DockerHub special case: "index.docker.io" -> "https://index.docker.io/v1/"
+    if registry == "index.docker.io" || registry == "docker.io" {
+        keys.push("https://index.docker.io/v1/".to_string());
+    }
+
+    // 5. If the registry already has https://, also try without it
+    if let Some(bare) = registry.strip_prefix("https://") {
+        keys.push(bare.trim_end_matches('/').to_string());
+        keys.push(bare.trim_end_matches('/').to_string());
+    }
+
+    keys
 }
 
 #[cfg(test)]
