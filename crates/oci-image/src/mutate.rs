@@ -90,6 +90,27 @@ impl MutableImage {
     pub fn layer_count(&self) -> usize {
         self.layers.len()
     }
+
+    /// Recompute config_bytes and update the manifest.config descriptor.
+    ///
+    /// **Must** be called after any direct mutation of `self.config` that
+    /// doesn't go through the `mutate::*` helpers (e.g. setting
+    /// `config.os`, `config.architecture`, clearing timestamps for
+    /// reproducibility, etc.). If this is not called, the manifest's
+    /// config descriptor will reference a stale digest, causing
+    /// `MANIFEST_BLOB_UNKNOWN` errors on push.
+    pub fn recalculate_config_descriptor(&mut self) {
+        self.config_bytes = serde_json::to_vec(&self.config).unwrap_or_default();
+        let config_digest = Sha256Digest::from_bytes(&self.config_bytes);
+        let config_size = self.config_bytes.len() as u64;
+        self.manifest.config = Descriptor {
+            media_type: self.manifest.config.media_type.clone(),
+            digest: config_digest,
+            size: config_size,
+            annotations: Default::default(),
+            platform: None,
+        };
+    }
 }
 
 /// Append layers to an image.

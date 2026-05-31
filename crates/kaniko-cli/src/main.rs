@@ -491,7 +491,6 @@ async fn do_build(
 
         // Update the image config with the modified container config
         image.config.config = container_config;
-        image.config_bytes = serde_json::to_vec(&image.config)?;
 
         // Set platform (os/architecture) from --platform or auto-detect.
         // Analogous to Go: `configFile.OS = runtime.GOOS; configFile.Architecture = runtime.GOARCH`.
@@ -501,6 +500,13 @@ async fn do_build(
         if cli.reproducible {
             make_reproducible(&mut image);
         }
+
+        // Recompute config_bytes and sync manifest.config descriptor.
+        // All config mutations above (container_config, platform, reproducible)
+        // must be reflected in the manifest's config descriptor, otherwise
+        // the registry will reject the manifest with MANIFEST_BLOB_UNKNOWN
+        // because the referenced config digest doesn't match any uploaded blob.
+        image.recalculate_config_descriptor();
 
         built_images.insert(stage_idx, image);
 
