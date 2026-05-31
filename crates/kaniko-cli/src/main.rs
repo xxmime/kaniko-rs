@@ -572,6 +572,17 @@ async fn do_push(
 
     // Push to registry unless --no-push
     if cli.no_push {
+        // When --no-push and destination looks like a local tar file (ends with .tar),
+        // automatically save the image there
+        if cli.tar_path.is_none() {
+            for dest in &cli.destination {
+                if dest.ends_with(".tar") && !dest.contains('/') && !dest.contains(':') {
+                    tracing::info!("Saving image to local tar file: {}", dest);
+                    write_image_tar(image, dest)?;
+                    break;
+                }
+            }
+        }
         tracing::info!("Skipping push to container registry due to --no-push flag");
         return Ok(());
     }
