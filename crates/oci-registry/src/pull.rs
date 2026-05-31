@@ -221,8 +221,8 @@ async fn get_manifest_with_platform(
                 (os.to_string(), arch.to_string())
             }
             None => {
-                // Default to current platform
-                ("linux".to_string(), std::env::consts::ARCH.to_string())
+                // Default to current platform, mapping Rust arch names to OCI names
+                ("linux".to_string(), rust_arch_to_oci(std::env::consts::ARCH))
             }
         };
 
@@ -429,4 +429,19 @@ fn base64_encode(s: &str) -> String {
         result.push(if chunk.len() > 2 { CHARSET[(n & 0x3F) as usize] as char } else { '=' });
     }
     result
+}
+
+/// Map Rust's `std::env::consts::ARCH` to OCI architecture names.
+/// Rust uses Go-style names (x86_64, aarch64) while OCI uses
+/// Docker-style names (amd64, arm64).
+fn rust_arch_to_oci(arch: &str) -> String {
+    match arch {
+        "x86_64" => "amd64".to_string(),
+        "aarch64" => "arm64".to_string(),
+        "arm" => "arm".to_string(),
+        "riscv64" => "riscv64".to_string(),
+        "s390x" => "s390x".to_string(),
+        "powerpc64" | "powerpc64le" => "ppc64le".to_string(),
+        other => other.to_string(),
+    }
 }
