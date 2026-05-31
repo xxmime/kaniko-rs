@@ -429,7 +429,7 @@ async fn do_build(
 
         // Extract base image layers to rootfs directory
         let root_dir = if !cli.initial_fs_unpacked {
-            let rootfs = std::env::temp_dir().join(format!("kaniko-rootfs-{}", stage_idx));
+            let rootfs = PathBuf::from("/sandbox");
             if rootfs.exists() {
                 std::fs::remove_dir_all(&rootfs)?;
             }
