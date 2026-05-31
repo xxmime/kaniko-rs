@@ -1,16 +1,13 @@
 //! Container runtime implementation for RUN command execution.
 //!
-//! This module provides a more complete container runtime implementation
-//! that matches Go's SysProcAttr.Credential and chroot functionality.
-//!
 //! Sandbox flow (matching Go kaniko):
 //! 1. `apply_sandbox()` re-executes the process inside `unshare(CLONE_NEWUSER|CLONE_NEWNS)`
 //!    so we gain CAP_SYS_ADMIN in the new namespaces.
-//! 2. Before each RUN command, `prepare_rootfs()` bind-mounts /proc, /sys, /dev
+//! 2. Before each RUN command, `prepare_rootfs()` mounts /proc, /sys, /dev
 //!    into the rootfs directory.
 //! 3. `execute_in_container()` uses `chroot(rootfs)` to run the command.
 //! 4. After the command, `cleanup_rootfs()` unmounts those filesystems.
-//! 5. If any mount step fails, we gracefully fall back to running without chroot.
+//! 5. If mount fails, we still try chroot (many commands work without /proc).
 
 use crate::command::{CommandError, Result};
 use std::collections::HashMap;
@@ -32,11 +29,12 @@ pub fn is_sandbox_active() -> bool {
     SANDBOX_ACTIVE.load(Ordering::Relaxed)
 }
 
-/// Kernel virtual filesystems to bind-mount into the rootfs.
-const KERNEL_FS: &[(&str, &str)] = &[
-    ("/proc", "proc"),
-    ("/sys", "sys"),
-    ("/dev", "dev"),
+/// Filesystems to mount into the rootfs.
+/// (mount_type, source, mount_point_name)
+const ROOTFS_MOUNTS: &[(&str, &str, &str)] = &[
+    ("proc", "proc", "proc"),       // mount -t proc proc /sandbox/proc
+    ("sysfs", "sysfs", "sys"),      // mount -t sysfs sysfs /sandbox/sys
+    ("bind", "/dev", "dev"),        // mount --bind /dev /sandbox/dev
 ];
 
 /// Container runtime configuration
@@ -66,11 +64,12 @@ impl Default for ContainerRuntimeConfig {
     }
 }
 
-/// Prepare the rootfs for chroot execution by bind-mounting kernel filesystems.
+/// Prepare the rootfs for chroot execution by mounting kernel filesystems.
 ///
-/// This mirrors Go's `mountSandboxKernelFilesystems`. When sandbox mode is
-/// active and we have CAP_SYS_ADMIN, we bind-mount /proc, /sys, /dev into
-/// the rootfs so that chrooted processes can access them.
+/// This mirrors Go's `mountSandboxKernelFilesystems`:
+/// - /proc: `mount -t proc` (new procfs instance, not bind-mount)
+/// - /sys:  `mount -t sysfs` (new sysfs instance)
+/// - /dev:  `mount --bind /dev` (bind-mount host /dev)
 ///
 /// Returns `true` if at least /proc was mounted successfully.
 pub fn prepare_rootfs(root_dir: &PathBuf) -> bool {
@@ -80,7 +79,7 @@ pub fn prepare_rootfs(root_dir: &PathBuf) -> bool {
 
     let mut proc_mounted = false;
 
-    for (src, name) in KERNEL_FS {
+    for (mount_type, source, name) in ROOTFS_MOUNTS {
         let dest = root_dir.join(name);
         // Create the mount point if it doesn't exist
         if !dest.exists() {
@@ -90,71 +89,94 @@ pub fn prepare_rootfs(root_dir: &PathBuf) -> bool {
             }
         }
 
-        // Try bind-mount
-        let output = std::process::Command::new("mount")
-            .arg("--bind")
-            .arg(src)
-            .arg(&dest)
-            .output();
+        let output = if *mount_type == "bind" {
+            std::process::Command::new("mount")
+                .arg("--bind")
+                .arg(source)
+                .arg(&dest)
+                .output()
+        } else {
+            // mount -t <type> <source> <dest>
+            std::process::Command::new("mount")
+                .arg("-t")
+                .arg(mount_type)
+                .arg(source)
+                .arg(&dest)
+                .output()
+        };
 
         match output {
             Ok(o) if o.status.success() => {
-                tracing::debug!("sandbox: bind-mounted {} -> {}", src, dest.display());
+                tracing::debug!("sandbox: mounted {} ({}) -> {}", source, mount_type, dest.display());
                 if *name == "proc" {
                     proc_mounted = true;
                 }
             }
             Ok(o) => {
                 let stderr = String::from_utf8_lossy(&o.stderr);
-                tracing::debug!("sandbox: mount {} failed: {}", src, stderr.trim());
+                tracing::warn!("sandbox: mount {} ({}) failed: {}", source, mount_type, stderr.trim());
             }
             Err(e) => {
-                tracing::debug!("sandbox: mount {} error: {}", src, e);
+                tracing::warn!("sandbox: mount {} ({}) error: {}", source, mount_type, e);
             }
         }
     }
 
     if !proc_mounted {
-        tracing::warn!("sandbox: /proc mount failed, chroot will be disabled for this command");
+        tracing::warn!("sandbox: /proc mount failed, some commands may not work");
     }
 
     proc_mounted
 }
 
 /// Clean up the rootfs by unmounting kernel filesystems.
-///
-/// This mirrors Go's cleanup after a RUN command. Must be called after
-/// `prepare_rootfs` to avoid leaking mount points.
 pub fn cleanup_rootfs(root_dir: &PathBuf) {
     if !is_sandbox_active() {
         return;
     }
 
     // Unmount in reverse order
-    for (_, name) in KERNEL_FS.iter().rev() {
+    for (_, _, name) in ROOTFS_MOUNTS.iter().rev() {
         let dest = root_dir.join(name);
-        if dest.exists() {
-            let output = std::process::Command::new("umount")
-                .arg(&dest)
-                .output();
+        // Check if it's actually a mount point before trying to unmount
+        let check = std::process::Command::new("mountpoint")
+            .arg("-q")
+            .arg(&dest)
+            .status();
 
-            match output {
-                Ok(o) if o.status.success() => {
-                    tracing::debug!("sandbox: unmounted {}", dest.display());
+        match check {
+            Ok(s) if s.success() => {
+                let output = std::process::Command::new("umount")
+                    .arg(&dest)
+                    .output();
+                match output {
+                    Ok(o) if o.status.success() => {
+                        tracing::debug!("sandbox: unmounted {}", dest.display());
+                    }
+                    Ok(o) => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        tracing::debug!("sandbox: umount {} failed: {}", dest.display(), stderr.trim());
+                    }
+                    Err(e) => {
+                        tracing::debug!("sandbox: umount {} error: {}", dest.display(), e);
+                    }
                 }
-                Ok(o) => {
-                    let stderr = String::from_utf8_lossy(&o.stderr);
-                    tracing::debug!("sandbox: umount {} failed: {}", dest.display(), stderr.trim());
-                }
-                Err(e) => {
-                    tracing::debug!("sandbox: umount {} error: {}", dest.display(), e);
-                }
+            }
+            _ => {
+                tracing::debug!("sandbox: {} is not a mount point, skipping", dest.display());
             }
         }
     }
 }
 
-/// Execute a command in a container-like environment
+/// Execute a command in a container-like environment.
+///
+/// When sandbox is active and root_dir is set, we:
+/// 1. Prepare rootfs (mount /proc, /sys, /dev)
+/// 2. chroot into rootfs and execute
+/// 3. Clean up mounts
+///
+/// If sandbox is not active, falls back to unshare+chroot or direct execution.
 pub async fn execute_in_container(
     program: &str,
     args: &[String],
@@ -162,41 +184,32 @@ pub async fn execute_in_container(
 ) -> Result<std::process::Output> {
     let use_chroot = cfg!(target_os = "linux") && config.root_dir != PathBuf::from("/");
 
-    if use_chroot {
-        // Prepare rootfs (bind-mount /proc, /sys, /dev)
-        let rootfs_ready = prepare_rootfs(&config.root_dir);
+    if use_chroot && is_sandbox_active() {
+        // Sandbox path: prepare rootfs, then chroot directly
+        // (we're already in the user namespace from apply_sandbox)
+        let _rootfs_ready = prepare_rootfs(&config.root_dir);
 
-        let result = if rootfs_ready {
-            // Use chroot with prepared rootfs
-            execute_chroot(program, args, config).await
-        } else {
-            // Fallback: use unshare without chroot, or just run directly
-            // Try unshare chroot first, then fall back to direct execution
-            match execute_unshare_chroot(program, args, config).await {
-                Ok(output) if output.status.success() => Ok(output),
-                Ok(output) => {
-                    // chroot failed, try without chroot but set PATH from rootfs
-                    tracing::warn!("sandbox: chroot execution failed, falling back to direct execution");
-                    execute_direct(program, args, config).await
-                }
-                Err(_) => {
-                    tracing::warn!("sandbox: chroot failed, falling back to direct execution");
-                    execute_direct(program, args, config).await
-                }
-            }
-        };
+        // Always try chroot — many commands work even without /proc mounted
+        let result = execute_chroot(program, args, config).await;
 
-        // Clean up mounts
         cleanup_rootfs(&config.root_dir);
-
         result
+    } else if use_chroot {
+        // Non-sandbox path: use unshare+chroot
+        let result = execute_unshare_chroot(program, args, config).await;
+        match result {
+            Ok(output) if output.status.success() => Ok(output),
+            Ok(_) | Err(_) => {
+                tracing::warn!("chroot execution failed, falling back to direct execution");
+                execute_direct(program, args, config).await
+            }
+        }
     } else {
-        // No chroot needed — run directly
         execute_direct(program, args, config).await
     }
 }
 
-/// Execute a command using chroot (requires prepared rootfs with /proc etc.)
+/// Execute a command using chroot.
 async fn execute_chroot(
     program: &str,
     args: &[String],
@@ -205,32 +218,24 @@ async fn execute_chroot(
     let mut cmd = Command::new("chroot");
     cmd.arg(&config.root_dir);
 
-    // Add user switching if specified
     if let Some(ref user) = config.user {
-        // Run as specified user inside chroot
         cmd.arg("su").arg("-").arg(user);
         cmd.arg("-c");
         cmd.arg(&format_command(program, args));
     } else {
-        cmd.arg("--");
-        cmd.arg(program);
-        cmd.args(args);
+        cmd.arg("--").arg(program).args(args);
     }
 
-    // Set environment variables
     cmd.envs(&config.env);
 
-    // Ensure PATH includes common locations
     if !config.env.contains_key("PATH") {
         cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
     }
 
-    // Set working directory
     if let Some(ref workdir) = config.working_dir {
         cmd.current_dir(workdir);
     }
 
-    // Capture output
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let output = cmd
@@ -241,7 +246,7 @@ async fn execute_chroot(
     Ok(output)
 }
 
-/// Execute a command using unshare + chroot (fallback when rootfs is not prepared)
+/// Execute a command using unshare + chroot (non-sandbox path).
 async fn execute_unshare_chroot(
     program: &str,
     args: &[String],
@@ -257,21 +262,18 @@ async fn execute_unshare_chroot(
         .arg("chroot")
         .arg(&config.root_dir);
 
-    // Add user switching if specified
     if let Some(ref user) = config.user {
         cmd.arg("su").arg("-").arg(user);
     }
 
     cmd.arg("--").arg(program).args(args);
 
-    // Set environment variables
     cmd.envs(&config.env);
 
     if !config.env.contains_key("PATH") {
         cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
     }
 
-    // Set working directory
     if let Some(ref workdir) = config.working_dir {
         cmd.current_dir(workdir);
     }
@@ -286,7 +288,7 @@ async fn execute_unshare_chroot(
     Ok(output)
 }
 
-/// Execute a command directly (no chroot, no namespace isolation)
+/// Execute a command directly (no chroot, no namespace isolation).
 async fn execute_direct(
     program: &str,
     args: &[String],
@@ -294,11 +296,8 @@ async fn execute_direct(
 ) -> Result<std::process::Output> {
     let mut cmd = Command::new(program);
     cmd.args(args);
-
-    // Set environment variables
     cmd.envs(&config.env);
 
-    // Set working directory
     if let Some(ref workdir) = config.working_dir {
         cmd.current_dir(workdir);
     }
@@ -322,7 +321,6 @@ fn format_command(program: &str, args: &[String]) -> String {
 
 /// Parse user credentials from string (username or uid[:gid])
 pub fn parse_user_credentials(user_str: &str) -> Result<(u32, u32, Vec<u32>)> {
-    // Try parsing as uid:gid first
     if let Some((uid_str, gid_str)) = user_str.split_once(':') {
         let uid = uid_str.parse::<u32>()
             .map_err(|_| CommandError::Failed(format!("Invalid UID: {}", uid_str)))?;
@@ -331,42 +329,38 @@ pub fn parse_user_credentials(user_str: &str) -> Result<(u32, u32, Vec<u32>)> {
         return Ok((uid, gid, vec![]));
     }
 
-    // Try parsing as numeric uid
     if let Ok(uid) = user_str.parse::<u32>() {
         return Ok((uid, uid, vec![]));
     }
 
-    // Look up user by name
     #[cfg(target_os = "linux")]
     {
         use std::ffi::CString;
-        
+
         let c_user = CString::new(user_str)
             .map_err(|_| CommandError::Failed(format!("Invalid username: {}", user_str)))?;
-        
+
         unsafe {
             let pwd = libc::getpwnam(c_user.as_ptr());
             if pwd.is_null() {
                 return Err(CommandError::Failed(format!("User not found: {}", user_str)));
             }
-            
+
             let uid = (*pwd).pw_uid;
             let gid = (*pwd).pw_gid;
-            
-            // Get supplementary groups
+
             let mut groups = vec![gid];
             let mut ngroups = 0;
-            
-            // First call to get the number of groups
+
             if libc::getgrouplist(c_user.as_ptr(), gid, std::ptr::null_mut(), &mut ngroups) == -1 {
                 groups.reserve(ngroups as usize);
                 groups.resize(ngroups as usize, 0);
-                
+
                 if libc::getgrouplist(c_user.as_ptr(), gid, groups.as_mut_ptr(), &mut ngroups) != -1 {
                     groups.truncate(ngroups as usize);
                 }
             }
-            
+
             Ok((uid, gid, groups))
         }
     }
@@ -377,27 +371,24 @@ pub fn parse_user_credentials(user_str: &str) -> Result<(u32, u32, Vec<u32>)> {
     }
 }
 
-/// Add default HOME environment variable if not present
+/// Add default HOME environment variable if not present.
 pub fn add_default_home(user_str: &str, envs: &mut HashMap<String, String>) -> Result<()> {
-    // Check if HOME is already set
     if envs.contains_key("HOME") {
         return Ok(());
     }
 
-    // Default HOME values
     if user_str.is_empty() || user_str == "root" || user_str == "0" {
         envs.insert("HOME".to_string(), "/root".to_string());
         return Ok(());
     }
 
-    // Look up user's home directory
     #[cfg(target_os = "linux")]
     {
         use std::ffi::CString;
-        
+
         let c_user = CString::new(user_str)
             .map_err(|_| CommandError::Failed(format!("Invalid username: {}", user_str)))?;
-        
+
         unsafe {
             let pwd = libc::getpwnam(c_user.as_ptr());
             if !pwd.is_null() {
@@ -408,13 +399,12 @@ pub fn add_default_home(user_str: &str, envs: &mut HashMap<String, String>) -> R
         }
     }
 
-    // Fallback: if username provided, use /home/username, otherwise /
     let home = if user_str.parse::<u32>().is_ok() {
         "/".to_string()
     } else {
         format!("/home/{}", user_str)
     };
-    
+
     envs.insert("HOME".to_string(), home);
     Ok(())
 }
