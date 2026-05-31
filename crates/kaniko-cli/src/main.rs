@@ -427,6 +427,20 @@ async fn do_build(
             pull_image_with_retry(&stage.image, &auth, cli.image_download_retry).await?
         };
 
+        // Extract base image layers to rootfs directory
+        let root_dir = if !cli.initial_fs_unpacked {
+            let rootfs = std::env::temp_dir().join(format!("kaniko-rootfs-{}", stage_idx));
+            if rootfs.exists() {
+                std::fs::remove_dir_all(&rootfs)?;
+            }
+            std::fs::create_dir_all(&rootfs)?;
+            tracing::info!("Extracting base image to {}", rootfs.display());
+            oci_image::extract::extract_image_to_fs(&image, &rootfs)?;
+            rootfs
+        } else {
+            PathBuf::from("/")
+        };
+
         // Initialize config (analogous to Go: initConfig)
         init_config(&mut image, &cli_labels);
 
@@ -451,6 +465,7 @@ async fn do_build(
                 &build_args,
                 context_path,
                 cli,
+                &root_dir,
             ).await?;
 
             // Track ENTRYPOINT/CMD presence for reviewConfig
@@ -733,6 +748,7 @@ async fn execute_instruction(
     args: &BuildArgs,
     context_path: &PathBuf,
     cli: &Cli,
+    root_dir: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let result: Result<(), kaniko_core::command::CommandError> = match instruction {
         dockerfile_parser::Instruction::From(_) => {
@@ -802,6 +818,7 @@ async fn execute_instruction(
                 if let Some(network) = &run.network {
                     c = c.with_network(network.clone());
                 }
+                c = c.with_root_dir(root_dir.clone());
                 c.execute(config, args).await
             } else {
                 let mut c = if run.is_shell_form {
@@ -820,6 +837,7 @@ async fn execute_instruction(
                 if let Some(network) = &run.network {
                     c = c.with_network(network.clone());
                 }
+                c = c.with_root_dir(root_dir.to_string_lossy().to_string());
                 c.execute(config, args).await
             }
         }
