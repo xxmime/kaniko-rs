@@ -43,6 +43,8 @@ pub enum PullError {
     Transport(#[from] crate::transport::TransportError),
     #[error("invalid reference: {0}")]
     Reference(#[from] ReferenceError),
+    #[error("unauthorized: {0}, www_authenticate: {1}")]
+    Unauthorized(String, String),
 }
 
 /// Result type for pull operations.
@@ -89,13 +91,26 @@ pub async fn pull_image_with_platform(
     tracing::info!("Pulling image from {}", reference_str);
 
     // Step 1: Authenticate
-    let token = authenticate_pull(&client, &base_url, &reference.repository, auth).await?;
-    let auth_header = if token.is_empty() { String::new() } else { token };
+    let mut auth_header = authenticate_pull(&client, &base_url, &reference.repository, auth).await?;
 
     // Step 2: Get manifest (may be a manifest list)
-    let manifest = get_manifest_with_platform(
+    // If we get 401, re-authenticate using the WWW-Authenticate header from the response
+    let manifest = match get_manifest_with_platform(
         &client, &base_url, &reference.repository, &reference.tag, &auth_header, platform,
-    ).await?;
+    ).await {
+        Ok(m) => Ok(m),
+        Err(PullError::Unauthorized(_, www_auth)) if !www_auth.is_empty() => {
+            tracing::info!("Manifest request returned 401, re-authenticating with WWW-Authenticate...");
+            auth_header = obtain_bearer_token_pull(&client, &www_auth, &reference.repository, auth).await?;
+            get_manifest_with_platform(
+                &client, &base_url, &reference.repository, &reference.tag, &auth_header, platform,
+            ).await
+        }
+        Err(PullError::Unauthorized(msg, _)) => {
+            Err(PullError::Auth(format!("unauthorized and no WWW-Authenticate: {}", msg)))
+        }
+        other => other,
+    }?;
     tracing::info!("Got manifest with {} layers", manifest.layers.len());
 
     // Step 3: Get config blob
@@ -159,6 +174,19 @@ async fn get_manifest_with_platform(
         .header("Accept", &accept_header)
         .send()
         .await?;
+
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        let www_auth = resp.headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(PullError::Unauthorized(
+            format!("manifest pull failed: HTTP 401 - {}", body),
+            www_auth,
+        ));
+    }
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -267,31 +295,53 @@ async fn get_blob(
 }
 
 /// Authenticate for pull operations.
+///
+/// OCI Distribution Spec auth flow:
+/// 1. Try the /v2/ ping endpoint to discover auth requirements
+/// 2. If WWW-Authenticate header is present, obtain a Bearer token
+/// 3. For Docker Hub public repos, anonymous token requests are supported
 async fn authenticate_pull(
     client: &reqwest::Client,
     base_url: &str,
     repository: &str,
     auth: &RegistryAuth,
 ) -> Result<String> {
-    // Try unauthenticated first
-    let check_url = format!("{}/{}/blobs/", base_url, repository);
-    let resp = client.get(&check_url).send().await;
+    // Step 1: Ping /v2/ to discover auth requirements
+    // Per OCI spec, all registries must respond to GET /v2/
+    let ping_url = format!("{}/", base_url);
+    tracing::debug!("Auth ping: {}", ping_url);
+
+    let resp = client.get(&ping_url).send().await;
 
     match resp {
         Ok(r) => {
+            let status = r.status();
+            tracing::debug!("Auth ping response: {}", status);
+
             if let Some(www_auth) = r.headers().get("www-authenticate") {
                 let www_auth_str = www_auth.to_str()
                     .map_err(|_| PullError::Auth("invalid www-authenticate header".into()))?;
+                tracing::debug!("WWW-Authenticate: {}", www_auth_str);
                 return obtain_bearer_token_pull(client, www_auth_str, repository, auth).await;
             }
+
+            // No auth required — registry allows anonymous access
             Ok(String::new())
         }
-        Err(_) => {
-            // For public repositories (like Docker Hub), we can proceed without credentials
-            if auth.credential.username.is_empty() {
-                Ok(String::new())
-            } else {
+        Err(e) => {
+            // Network error — try with Basic auth if credentials are provided
+            tracing::debug!("Auth ping failed: {}", e);
+            if !auth.credential.username.is_empty() {
                 Ok(format!("Basic {}", base64_encode(&format!("{}:{}", auth.credential.username, auth.credential.password))))
+            } else {
+                // Last resort: try anonymous Bearer token for known registries
+                // Docker Hub requires a token even for public repos
+                if base_url.contains("docker.io") {
+                    tracing::debug!("Attempting anonymous Docker Hub token");
+                    let www_auth = r#"Bearer realm="https://auth.docker.io/token",service="registry.docker.io""#;
+                    return obtain_bearer_token_pull(client, www_auth, repository, auth).await;
+                }
+                Ok(String::new())
             }
         }
     }
