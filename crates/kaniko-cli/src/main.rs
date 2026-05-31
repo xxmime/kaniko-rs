@@ -1144,11 +1144,54 @@ fn apply_sandbox(sandbox: bool) {
 
     #[cfg(target_os = "linux")]
     {
-        tracing::info!("Sandbox mode requested — using Linux namespace isolation");
-        // Full namespace isolation requires privileged execution.
-        // For now, we log that sandbox mode is active and rely on the
-        // container runtime's isolation. A future iteration could use
-        // the `nix` crate to call unshare(CLONE_NEWNS) etc.
+        // Check if we're already inside a user namespace
+        if std::env::var("KANIKO_SANDBOX_USERNS").as_deref() == Ok("1") {
+            tracing::info!("Sandbox: already running inside user namespace");
+            kaniko_core::container_runtime::set_sandbox_active(true);
+            return;
+        }
+
+        // Try to use unshare to create user+mount namespace
+        // This gives us CAP_SYS_ADMIN for bind-mounting /proc, /sys, /dev
+        tracing::info!("Sandbox mode — re-executing inside user+mount namespace");
+        let self_exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(e) => {
+                tracing::warn!("Sandbox: cannot determine self executable path: {}. Sandbox disabled.", e);
+                return;
+            }
+        };
+
+        let mut cmd = std::process::Command::new("unshare");
+        cmd.arg("--user")
+            .arg("--mount")
+            .arg("--fork")
+            .arg("--map-root-user")
+            .arg("--")
+            .arg(self_exe);
+
+        // Pass through all original arguments
+        let mut skip_sandbox = false;
+        for arg in std::env::args().skip(1) {
+            cmd.arg(&arg);
+            // Don't add --sandbox again to avoid infinite recursion
+            if arg == "--sandbox" {
+                skip_sandbox = true;
+            }
+        }
+
+        // Set env to indicate we're in sandbox namespace
+        cmd.env("KANIKO_SANDBOX_USERNS", "1");
+
+        match cmd.status() {
+            Ok(status) => {
+                // Exit with the same code as the re-executed process
+                std::process::exit(status.code().unwrap_or(1));
+            }
+            Err(e) => {
+                tracing::warn!("Sandbox: failed to re-execute with unshare: {}. Sandbox disabled.", e);
+            }
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
