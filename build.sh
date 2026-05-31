@@ -6,4 +6,4 @@ rm /usr/local/bin/kaniko-cli
 mv target/release/kaniko-cli /usr/local/bin
 
 echo "build test..."
-kaniko-cli --force --sandbox --dockerfile Dockerfile.linux --no-push --destination test.tar
+kaniko-cli --force --sandbox --dockerfile Dockerfile --no-push --destination test.tar

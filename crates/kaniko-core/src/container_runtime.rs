@@ -64,72 +64,46 @@ impl Default for ContainerRuntimeConfig {
     }
 }
 
-/// Prepare the rootfs for chroot execution by mounting kernel filesystems.
+/// Prepare the rootfs for chroot execution.
 ///
-/// This mirrors Go's `mountSandboxKernelFilesystems`:
-/// - /proc: `mount -t proc` (new procfs instance, not bind-mount)
-/// - /sys:  `mount -t sysfs` (new sysfs instance)
-/// - /dev:  `mount --bind /dev` (bind-mount host /dev)
+/// This sets up the essential files and directories needed for commands
+/// inside the chroot to work correctly:
 ///
-/// Returns `true` if at least /proc was mounted successfully.
-pub fn prepare_rootfs(root_dir: &PathBuf) -> bool {
+/// 1. Copy /etc/resolv.conf and /etc/hosts from host for DNS resolution
+/// 2. Create /etc/hostname if missing
+/// 3. Write APT sandbox config to prevent seteuid failures
+/// 4. Create basic /dev entries (null, zero, random, urandom, tty)
+///
+/// Note: We do NOT attempt to mount proc/sys/dev here because:
+/// - In a user namespace, mounting sysfs is forbidden by the kernel
+/// - Mounting proc requires proper mount namespace ownership
+/// - These mounts are attempted inside the per-command unshare instead
+pub fn prepare_rootfs(root_dir: &PathBuf) {
     if !is_sandbox_active() {
-        return false;
+        return;
     }
 
-    let mut proc_mounted = false;
+    // Copy DNS configuration from host
+    copy_host_file("/etc/resolv.conf", &root_dir.join("etc/resolv.conf"));
+    copy_host_file("/etc/hosts", &root_dir.join("etc/hosts"));
 
-    for (mount_type, source, name) in ROOTFS_MOUNTS {
-        let dest = root_dir.join(name);
-        // Create the mount point if it doesn't exist
-        if !dest.exists() {
-            if let Err(e) = std::fs::create_dir_all(&dest) {
-                tracing::debug!("sandbox: failed to create {}: {}", dest.display(), e);
-                continue;
-            }
-        }
-
-        let output = if *mount_type == "bind" {
-            std::process::Command::new("mount")
-                .arg("--bind")
-                .arg(source)
-                .arg(&dest)
-                .output()
-        } else {
-            // mount -t <type> <source> <dest>
-            std::process::Command::new("mount")
-                .arg("-t")
-                .arg(mount_type)
-                .arg(source)
-                .arg(&dest)
-                .output()
-        };
-
-        match output {
-            Ok(o) if o.status.success() => {
-                tracing::debug!("sandbox: mounted {} ({}) -> {}", source, mount_type, dest.display());
-                if *name == "proc" {
-                    proc_mounted = true;
-                }
-            }
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                tracing::warn!("sandbox: mount {} ({}) failed: {}", source, mount_type, stderr.trim());
-            }
-            Err(e) => {
-                tracing::warn!("sandbox: mount {} ({}) error: {}", source, mount_type, e);
-            }
-        }
+    // Create /etc/hostname if not present
+    let hostname_path = root_dir.join("etc/hostname");
+    if !hostname_path.exists() {
+        let _ = std::fs::write(&hostname_path, "kaniko-builder\n");
     }
 
-    if !proc_mounted {
-        tracing::warn!("sandbox: /proc mount failed, some commands may not work");
+    // Create /etc/mtab symlink if not present (many tools expect this)
+    let mtab_path = root_dir.join("etc/mtab");
+    if !mtab_path.exists() {
+        let _ = std::fs::remove_file(&mtab_path);
+        let _ = std::os::unix::fs::symlink("/proc/mounts", &mtab_path);
     }
 
-    // In sandbox mode, write an APT config file that disables APT's internal
-    // sandboxing. In a user namespace, only UID 0 is mapped, so apt's attempt
-    // to switch to the _apt user (uid 100/42) fails with seteuid errors.
-    // This config tells apt to run sandboxed operations as root instead.
+    // Create basic /dev entries
+    create_minimal_dev(&root_dir.join("dev"));
+
+    // Write APT config to prevent sandboxing failures
     let apt_conf_dir = root_dir.join("etc/apt/apt.conf.d");
     if let Ok(()) = std::fs::create_dir_all(&apt_conf_dir) {
         let apt_conf_path = apt_conf_dir.join("99kaniko-sandbox");
@@ -137,11 +111,83 @@ pub fn prepare_rootfs(root_dir: &PathBuf) -> bool {
             tracing::debug!("sandbox: failed to write APT config: {}", e);
         }
     }
-
-    proc_mounted
 }
 
-/// Clean up the rootfs by unmounting kernel filesystems.
+/// Copy a file from the host system, preserving its content.
+/// If the source doesn't exist, create a minimal default.
+fn copy_host_file(src: &str, dest: &std::path::PathBuf) {
+    // Create parent directory
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    if std::path::Path::new(src).exists() {
+        match std::fs::copy(src, dest) {
+            Ok(_) => {
+                tracing::debug!("sandbox: copied {} to rootfs", src);
+            }
+            Err(e) => {
+                tracing::debug!("sandbox: failed to copy {}: {}", src, e);
+            }
+        }
+    }
+}
+
+/// Create a minimal /dev with essential device nodes.
+/// In a user namespace we can't create real device nodes (mknod requires CAP_MKNOD),
+/// so we create symlinks or empty files as placeholders.
+fn create_minimal_dev(dev_dir: &std::path::PathBuf) {
+    let _ = std::fs::create_dir_all(dev_dir);
+
+    // Try to create device nodes; if mknod fails (user namespace), create empty files
+    let devices = [
+        ("null", "1", "3"),
+        ("zero", "1", "5"),
+        ("random", "1", "8"),
+        ("urandom", "1", "9"),
+        ("tty", "5", "0"),
+    ];
+
+    for (name, major, minor) in &devices {
+        let path = dev_dir.join(name);
+        if path.exists() {
+            continue;
+        }
+
+        // Try mknod first (works when we have CAP_MKNOD)
+        let mknod_output = std::process::Command::new("mknod")
+            .arg(&path)
+            .arg("c")
+            .arg(major)
+            .arg(minor)
+            .output();
+
+        match mknod_output {
+            Ok(o) if o.status.success() => continue,
+            _ => {
+                // Fallback: create empty file as placeholder
+                let _ = std::fs::File::create(&path);
+            }
+        }
+    }
+
+    // Create /dev/pts and /dev/shm directories
+    let _ = std::fs::create_dir_all(dev_dir.join("pts"));
+    let _ = std::fs::create_dir_all(dev_dir.join("shm"));
+
+    // /dev/null must be writable; try chmod
+    let _ = std::process::Command::new("chmod")
+        .arg("666")
+        .arg(dev_dir.join("null"))
+        .output();
+}
+
+/// Clean up the rootfs after chroot execution.
+///
+/// Removes the APT sandbox config and any temporary files we created.
+/// Note: We don't need to unmount proc/sys/dev since we use per-command
+/// unshare namespaces (mounts are automatically cleaned up when the
+/// namespace is destroyed).
 pub fn cleanup_rootfs(root_dir: &PathBuf) {
     if !is_sandbox_active() {
         return;
@@ -153,35 +199,21 @@ pub fn cleanup_rootfs(root_dir: &PathBuf) {
         let _ = std::fs::remove_file(&apt_conf_path);
     }
 
-    // Unmount in reverse order
+    // Unmount any filesystems that might have been mounted inside
+    // per-command namespaces (these should already be gone, but clean up
+    // just in case)
     for (_, _, name) in ROOTFS_MOUNTS.iter().rev() {
         let dest = root_dir.join(name);
-        // Check if it's actually a mount point before trying to unmount
         let check = std::process::Command::new("mountpoint")
             .arg("-q")
             .arg(&dest)
             .status();
 
-        match check {
-            Ok(s) if s.success() => {
-                let output = std::process::Command::new("umount")
+        if let Ok(status) = check {
+            if status.success() {
+                let _ = std::process::Command::new("umount")
                     .arg(&dest)
                     .output();
-                match output {
-                    Ok(o) if o.status.success() => {
-                        tracing::debug!("sandbox: unmounted {}", dest.display());
-                    }
-                    Ok(o) => {
-                        let stderr = String::from_utf8_lossy(&o.stderr);
-                        tracing::debug!("sandbox: umount {} failed: {}", dest.display(), stderr.trim());
-                    }
-                    Err(e) => {
-                        tracing::debug!("sandbox: umount {} error: {}", dest.display(), e);
-                    }
-                }
-            }
-            _ => {
-                tracing::debug!("sandbox: {} is not a mount point, skipping", dest.display());
             }
         }
     }
@@ -189,10 +221,14 @@ pub fn cleanup_rootfs(root_dir: &PathBuf) {
 
 /// Execute a command in a container-like environment.
 ///
-/// When sandbox is active and root_dir is set, we:
-/// 1. Prepare rootfs (mount /proc, /sys, /dev)
-/// 2. chroot into rootfs and execute
-/// 3. Clean up mounts
+/// When sandbox is active and root_dir is set, we use `unshare --mount`
+/// to create a per-command mount namespace where we can:
+/// 1. Set mount propagation to slave
+/// 2. Mount /proc, /sys, /dev into the rootfs
+/// 3. chroot into the rootfs and execute the command
+///
+/// When the child process exits, the mount namespace is destroyed and
+/// all mounts are automatically cleaned up.
 ///
 /// If sandbox is not active, falls back to unshare+chroot or direct execution.
 pub async fn execute_in_container(
@@ -203,15 +239,10 @@ pub async fn execute_in_container(
     let use_chroot = cfg!(target_os = "linux") && config.root_dir != PathBuf::from("/");
 
     if use_chroot && is_sandbox_active() {
-        // Sandbox path: prepare rootfs, then chroot directly
-        // (we're already in the user namespace from apply_sandbox)
-        let _proc_mounted = prepare_rootfs(&config.root_dir);
-
-        // Always chroot — the build MUST run inside the container rootfs.
-        // Even without /proc mounted, many commands still work.
-        // Commands that need /proc will produce warnings but can often
-        // continue (e.g. apt with APT::Sandbox::User=root).
-        let result = execute_chroot(program, args, config).await;
+        // Sandbox path: prepare rootfs files, then execute in a per-command
+        // mount namespace with chroot
+        prepare_rootfs(&config.root_dir);
+        let result = execute_sandbox_chroot(program, args, config).await;
         cleanup_rootfs(&config.root_dir);
         result
     } else if use_chroot {
@@ -227,6 +258,95 @@ pub async fn execute_in_container(
     } else {
         execute_direct(program, args, config).await
     }
+}
+
+/// Execute a command inside a per-command mount namespace with chroot.
+///
+/// This uses `unshare --mount` to create an isolated mount namespace for
+/// each RUN command. Inside that namespace, we:
+/// 1. Set mount propagation to slave (matching Go chrootarchive)
+/// 2. Mount /proc, /sys, /dev into the rootfs
+/// 3. chroot into the rootfs
+/// 4. Execute the command
+///
+/// The mount namespace is destroyed when the process exits, automatically
+/// cleaning up all mounts.
+async fn execute_sandbox_chroot(
+    program: &str,
+    args: &[String],
+    config: &ContainerRuntimeConfig,
+) -> Result<std::process::Output> {
+    // Build a shell script that:
+    // 1. Makes mount tree slave
+    // 2. Mounts proc/sys/dev into rootfs
+    // 3. chroots into rootfs and runs the command
+    let root_dir = &config.root_dir;
+    let root_dir_str = root_dir.to_string_lossy();
+
+    // Build the command string for inside chroot
+    let inner_cmd = if let Some(ref user) = config.user {
+        format!("su - {} -c {}", shell_quote(user), shell_quote(&format_command(program, args)))
+    } else {
+        format!("{} {}", shell_quote(program), args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" "))
+    };
+
+    // Build env exports
+    let mut env_exports = String::new();
+    for (k, v) in &config.env {
+        env_exports.push_str(&format!("export {}={}\n", shell_quote(k), shell_quote(v)));
+    }
+    if !config.env.contains_key("PATH") {
+        env_exports.push_str("export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n");
+    }
+    if !config.env.contains_key("DEBIAN_FRONTEND") {
+        env_exports.push_str("export DEBIAN_FRONTEND=noninteractive\n");
+    }
+
+    let script = format!(
+r#"#!/bin/sh
+set -e
+
+# Make mount tree slave — matching Go chrootarchive MakeRSlave("/")
+mount --make-rslave / 2>/dev/null || true
+
+# Mount kernel filesystems into rootfs (best-effort)
+mkdir -p {root}/proc {root}/sys {root}/dev 2>/dev/null || true
+mount -t proc proc {root}/proc 2>/dev/null || echo "sandbox: /proc mount failed (non-fatal)" >&2
+mount -t sysfs sysfs {root}/sys 2>/dev/null || echo "sandbox: /sys mount failed (non-fatal)" >&2
+mount --bind /dev {root}/dev 2>/dev/null || echo "sandbox: /dev bind mount failed (non-fatal)" >&2
+
+# Set up environment
+{env_exports}
+
+# Execute inside chroot
+chroot {root} /bin/sh -c {cmd}
+"#,
+        root = root_dir_str,
+        env_exports = env_exports,
+        cmd = shell_quote(&inner_cmd),
+    );
+
+    let mut cmd = Command::new("unshare");
+    cmd.arg("--mount")
+        .arg("--propagation")
+        .arg("slave")
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(&script);
+
+    if let Some(ref workdir) = config.working_dir {
+        cmd.current_dir(workdir);
+    }
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| CommandError::Failed(format!("Failed to execute sandbox chroot: {}", e)))?;
+
+    Ok(output)
 }
 
 /// Execute a command using chroot.
@@ -247,15 +367,6 @@ async fn execute_chroot(
     }
 
     cmd.envs(&config.env);
-
-    // In sandbox mode (user namespace), only UID 0 (root) is mapped.
-    // Prevent apt from trying to sandbox itself by switching to the _apt user,
-    // which would fail with seteuid/setgroups errors.
-    // We pass the config via -o flag in the command's environment, which is
-    // more reliable than APT_CONFIG (which expects a file path).
-    if is_sandbox_active() {
-        cmd.env("DEBIAN_FRONTEND", "noninteractive");
-    }
 
     if !config.env.contains_key("PATH") {
         cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
@@ -298,15 +409,6 @@ async fn execute_unshare_chroot(
     cmd.arg(program).args(args);
 
     cmd.envs(&config.env);
-
-    // In sandbox mode (user namespace), only UID 0 (root) is mapped.
-    // Prevent apt from trying to sandbox itself by switching to the _apt user,
-    // which would fail with seteuid/setgroups errors.
-    // We pass the config via -o flag in the command's environment, which is
-    // more reliable than APT_CONFIG (which expects a file path).
-    if is_sandbox_active() {
-        cmd.env("DEBIAN_FRONTEND", "noninteractive");
-    }
 
     if !config.env.contains_key("PATH") {
         cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
@@ -355,6 +457,20 @@ fn format_command(program: &str, args: &[String]) -> String {
     let mut parts = vec![program.to_string()];
     parts.extend(args.iter().cloned());
     parts.join(" ")
+}
+
+/// Shell-quote a string for safe use in shell commands.
+/// Uses single quotes with proper escaping.
+fn shell_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    // If the string only contains safe characters, no quoting needed
+    if s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/') {
+        return s.to_string();
+    }
+    // Use single quotes, escaping any embedded single quotes
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Parse user credentials from string (username or uid[:gid])

@@ -1137,38 +1137,16 @@ fn set_dummy_destinations(cli: &mut Cli) {
 /// `KANIKO_SANDBOX_USERNS=1`). It performs setup that is required for
 /// commands inside chroot to work correctly:
 ///
-/// 1. `mount --make-rslave /` — Mark the mount tree as slave so that
-///    mount events from the parent namespace propagate in, but our mounts
-///    don't propagate out. This is required before we can mount /proc,
-///    /sys, /dev into the rootfs. (Matches Go: chrootarchive uses
-///    `mount.MakeRSlave("/")` before pivot_root.)
-///
-/// 2. Write "allow" to `/proc/self/setgroups` — `unshare --map-root-user`
+/// 1. Write "allow" to `/proc/self/setgroups` — `unshare --map-root-user`
 ///    sets this to "deny", but chrooted programs (apt, dpkg) need to call
 ///    setgroups. Writing "allow" re-enables it.
+///
+/// Note: Mount propagation setup is handled per-command inside
+/// `execute_sandbox_chroot` using `unshare --mount --propagation slave`,
+/// so we don't need to do it here globally.
 #[cfg(target_os = "linux")]
 fn init_user_namespace() {
-    // 1. Make mount tree slave — required before mounting proc/sys/dev.
-    // Using rslave (recursive) so all existing shared mounts become slave.
-    // This matches the Go chrootarchive implementation.
-    let output = std::process::Command::new("mount")
-        .arg("--make-rslave")
-        .arg("/")
-        .output();
-    match output {
-        Ok(o) if o.status.success() => {
-            tracing::debug!("sandbox: mount --make-rslave / succeeded");
-        }
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            tracing::warn!("sandbox: mount --make-rslave / failed: {}", stderr.trim());
-        }
-        Err(e) => {
-            tracing::warn!("sandbox: mount --make-rslave / error: {}", e);
-        }
-    }
-
-    // 2. Allow setgroups in the user namespace.
+    // Allow setgroups in the user namespace.
     // unshare --map-root-user writes "deny" to /proc/self/setgroups,
     // but programs like apt need to switch groups.
     let setgroups_path = "/proc/self/setgroups";
