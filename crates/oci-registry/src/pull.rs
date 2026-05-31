@@ -357,6 +357,16 @@ async fn obtain_bearer_token_pull(
     let mut realm = String::new();
     let mut service = String::new();
 
+    // Strip the "Bearer " prefix if present
+    let www_authenticate = www_authenticate.trim();
+    let www_authenticate = if let Some(stripped) = www_authenticate.strip_prefix("Bearer ") {
+        stripped
+    } else if let Some(stripped) = www_authenticate.strip_prefix("Basic ") {
+        stripped
+    } else {
+        www_authenticate
+    };
+
     for part in www_authenticate.split(',') {
         let part = part.trim();
         if let Some(val) = part.strip_prefix("realm=\"") {
