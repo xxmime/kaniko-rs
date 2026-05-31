@@ -95,6 +95,7 @@ fn should_ignore_path(path: &Path, ignore_paths: &[PathBuf]) -> bool {
 }
 
 /// Default tar entry extraction: unpack the entry to the root directory.
+/// Handles regular files, directories, symlinks, and hard links.
 fn extract_tar_entry(
     root_dir: &Path,
     entry_path: &Path,
@@ -107,8 +108,68 @@ fn extract_tar_entry(
         std::fs::create_dir_all(parent)?;
     }
 
-    entry.unpack(&dest_path)
-        .map_err(|e| ExtractError::Failed(format!("unpack {}: {}", dest_path.display(), e)))?;
+    let header = entry.header();
+
+    match header.entry_type() {
+        // Hard link: create a hard link to the already-extracted target
+        tar::EntryType::Link => {
+            let link_name = entry.link_name()
+                .map_err(|e| ExtractError::Failed(format!("get link name: {}", e)))?
+                .ok_or_else(|| ExtractError::Failed("hard link without target".into()))?;
+            let link_str = link_name.to_string_lossy();
+            let cleaned_link = link_str.trim_start_matches("./");
+            let link_target = root_dir.join(cleaned_link);
+
+            if !link_target.exists() {
+                return Err(ExtractError::Failed(format!(
+                    "hard link target not found: {} -> {}",
+                    entry_path.display(), link_target.display()
+                )));
+            }
+
+            // Remove existing file if present
+            if dest_path.exists() {
+                std::fs::remove_file(&dest_path)?;
+            }
+
+            std::fs::hard_link(&link_target, &dest_path)
+                .map_err(|e| ExtractError::Failed(format!(
+                    "hard link {} -> {}: {}",
+                    dest_path.display(), link_target.display(), e
+                )))?;
+        }
+        // Symlink: create a symbolic link
+        tar::EntryType::Symlink => {
+            let link_name = entry.link_name()
+                .map_err(|e| ExtractError::Failed(format!("get symlink target: {}", e)))?
+                .ok_or_else(|| ExtractError::Failed("symlink without target".into()))?;
+
+            // Remove existing file/symlink if present
+            if dest_path.exists() || dest_path.symlink_metadata().is_ok() {
+                std::fs::remove_file(&dest_path)?;
+            }
+
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&link_name, &dest_path)
+                    .map_err(|e| ExtractError::Failed(format!(
+                        "symlink {} -> {}: {}",
+                        dest_path.display(), link_name.display(), e
+                    )))?;
+            }
+            #[cfg(not(unix))]
+            {
+                // Fallback: just copy the entry using unpack
+                entry.unpack(&dest_path)
+                    .map_err(|e| ExtractError::Failed(format!("unpack {}: {}", dest_path.display(), e)))?;
+            }
+        }
+        // All other entry types: use tar's unpack
+        _ => {
+            entry.unpack(&dest_path)
+                .map_err(|e| ExtractError::Failed(format!("unpack {}: {}", dest_path.display(), e)))?;
+        }
+    }
 
     Ok(())
 }
