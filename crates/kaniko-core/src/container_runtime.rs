@@ -73,6 +73,7 @@ impl Default for ContainerRuntimeConfig {
 /// 2. Create /etc/hostname if missing
 /// 3. Write APT sandbox config to prevent seteuid failures
 /// 4. Create basic /dev entries (null, zero, random, urandom, tty)
+/// 5. Copy Docker credentials into rootfs for private registry access
 ///
 /// Note: We do NOT attempt to mount proc/sys/dev here because:
 /// - In a user namespace, mounting sysfs is forbidden by the kernel
@@ -111,6 +112,11 @@ pub fn prepare_rootfs(root_dir: &PathBuf) {
             tracing::debug!("sandbox: failed to write APT config: {}", e);
         }
     }
+
+    // Copy Docker credentials into rootfs for private registry access
+    // inside chroot. This allows processes like pip, apt, curl, etc.
+    // that need to authenticate with private registries inside the chroot.
+    copy_docker_credentials(root_dir);
 }
 
 /// Copy a file from the host system, preserving its content.
@@ -128,6 +134,97 @@ fn copy_host_file(src: &str, dest: &std::path::PathBuf) {
             }
             Err(e) => {
                 tracing::debug!("sandbox: failed to copy {}: {}", src, e);
+            }
+        }
+    }
+}
+
+/// Copy Docker credentials from the host into the rootfs.
+///
+/// This allows processes running inside the chroot to authenticate with
+/// private registries (e.g., `pip install` from a private PyPI, or
+/// `apt-get` from a private repo that requires auth).
+///
+/// Copies from the following host locations (in priority order):
+/// 1. /kaniko/.docker/ → rootfs/kaniko/.docker/
+/// 2. $DOCKER_CONFIG/ → rootfs/<same-path>/
+/// 3. $HOME/.docker/ → rootfs/root/.docker/
+fn copy_docker_credentials(root_dir: &PathBuf) {
+    // Collect candidate source directories for Docker credentials
+    let mut sources: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+
+    // 1. /kaniko/.docker (standard kaniko container location)
+    let kaniko_docker = std::path::PathBuf::from("/kaniko/.docker");
+    if kaniko_docker.join("config.json").exists() {
+        let dest = root_dir.join("kaniko/.docker");
+        sources.push((kaniko_docker, dest));
+    }
+
+    // 2. $DOCKER_CONFIG (explicit environment variable)
+    if let Ok(config_dir) = std::env::var("DOCKER_CONFIG") {
+        let src = std::path::PathBuf::from(&config_dir);
+        if src.join("config.json").exists() {
+            let dest = root_dir.join(&config_dir.trim_start_matches('/'));
+            sources.push((src, dest));
+        }
+    }
+
+    // 3. $HOME/.docker
+    if let Ok(home) = std::env::var("HOME") {
+        let src = std::path::PathBuf::from(&home).join(".docker");
+        if src.join("config.json").exists() {
+            let dest = root_dir.join("root/.docker");
+            sources.push((src, dest));
+        }
+    }
+
+    // 4. /root/.docker
+    let root_docker = std::path::PathBuf::from("/root/.docker");
+    if root_docker.join("config.json").exists() {
+        let dest = root_dir.join("root/.docker");
+        sources.push((root_docker, dest));
+    }
+
+    for (src_dir, dest_dir) in sources {
+        if dest_dir.join("config.json").exists() {
+            // Already copied (e.g., from a previous source or base image)
+            continue;
+        }
+
+        if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+            tracing::debug!("sandbox: failed to create docker config dir {}: {}", dest_dir.display(), e);
+            continue;
+        }
+
+        // Copy config.json
+        let src_config = src_dir.join("config.json");
+        let dest_config = dest_dir.join("config.json");
+        if src_config.exists() {
+            match std::fs::copy(&src_config, &dest_config) {
+                Ok(_) => tracing::debug!("sandbox: copied Docker credentials from {} to rootfs", src_dir.display()),
+                Err(e) => tracing::debug!("sandbox: failed to copy Docker credentials: {}", e),
+            }
+        }
+
+        // Copy credential helper binaries if they exist in the .docker directory
+        // (some setups store helpers alongside config.json)
+        for entry in std::fs::read_dir(&src_dir).unwrap_or_else(|_| std::fs::read_dir("/dev/null").unwrap()) {
+            if let Ok(entry) = entry {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("docker-credential-") {
+                    let src_file = entry.path();
+                    let dest_file = dest_dir.join(&*name);
+                    if !dest_file.exists() {
+                        let _ = std::fs::copy(&src_file, &dest_file);
+                        // Make executable
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let _ = std::fs::set_permissions(&dest_file, std::fs::Permissions::from_mode(0o755));
+                        }
+                    }
+                }
             }
         }
     }
@@ -197,6 +294,18 @@ pub fn cleanup_rootfs(root_dir: &PathBuf) {
     let apt_conf_path = root_dir.join("etc/apt/apt.conf.d/99kaniko-sandbox");
     if apt_conf_path.exists() {
         let _ = std::fs::remove_file(&apt_conf_path);
+    }
+
+    // Remove Docker credentials we copied into rootfs
+    // These should not persist in the final image
+    let docker_paths = [
+        root_dir.join("kaniko/.docker/config.json"),
+        root_dir.join("root/.docker/config.json"),
+    ];
+    for path in &docker_paths {
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     // Unmount any filesystems that might have been mounted inside
@@ -300,6 +409,26 @@ async fn execute_sandbox_chroot(
     }
     if !config.env.contains_key("DEBIAN_FRONTEND") {
         env_exports.push_str("export DEBIAN_FRONTEND=noninteractive\n");
+    }
+    // Ensure HOME is set for credential lookup inside chroot
+    if !config.env.contains_key("HOME") {
+        env_exports.push_str("export HOME=/root\n");
+    }
+    // Ensure DOCKER_CONFIG is set inside chroot so that processes
+    // can find Docker credentials for private registry access
+    if !config.env.contains_key("DOCKER_CONFIG") {
+        // Check which credential path exists in the rootfs
+        let kaniko_config = root_dir.join("kaniko/.docker");
+        let root_config = root_dir.join("root/.docker");
+        if kaniko_config.join("config.json").exists() {
+            env_exports.push_str(&format!("export DOCKER_CONFIG={}\n", shell_quote("/kaniko/.docker")));
+        } else if root_config.join("config.json").exists() {
+            env_exports.push_str(&format!("export DOCKER_CONFIG={}\n", shell_quote("/root/.docker")));
+        } else if let Ok(docker_config) = std::env::var("DOCKER_CONFIG") {
+            // Fall back to host DOCKER_CONFIG (might not exist in chroot, but try)
+            let chroot_path = format!("/{}", docker_config.trim_start_matches('/'));
+            env_exports.push_str(&format!("export DOCKER_CONFIG={}\n", shell_quote(&chroot_path)));
+        }
     }
 
     let script = format!(

@@ -85,7 +85,7 @@ async fn main() {
     tracing::info!("kaniko-rs executor starting");
 
     // Apply sandbox mode if requested
-    apply_sandbox(cli.sandbox);
+    apply_sandbox(cli.sandbox, cli.docker_config.as_deref());
 
     // Start build timing
     let total_timer = kaniko_util::timing::start("total_build");
@@ -603,8 +603,16 @@ async fn do_push(
         let reference = oci_registry::Reference::parse(dest)
             .map_err(|e| format!("Invalid destination {}: {}", dest, e))?;
         let registry = reference.registry.clone();
+        let repository = reference.repository.clone();
+        let tag = reference.tag.clone();
         let insecure = cli.insecure
             || cli.insecure_registry.contains(&registry);
+
+        tracing::info!(
+            "Push destination: registry={}, repository={}, tag={}, insecure={}, image digest={}",
+            registry, repository, tag, insecure, digest
+        );
+
         let credential = keychain.credentials(&registry)
             .unwrap_or_else(|e| {
                 tracing::warn!("Credential lookup failed for {}: {}, using anonymous", registry, e);
@@ -612,6 +620,13 @@ async fn do_push(
             });
         if credential.is_anonymous() {
             tracing::warn!("No credentials found for registry {}, pushing anonymously", registry);
+        } else {
+            tracing::info!(
+                "Using credentials for registry {} (username: {}{})",
+                registry,
+                credential.username,
+                if credential.identity_token.is_some() { ", identity_token: present" } else { "" }
+            );
         }
         let auth = RegistryAuth::new(&registry, credential)
             .insecure(insecure);
@@ -620,8 +635,21 @@ async fn do_push(
             .with_ignore_immutable_tag_errors(cli.push_ignore_immutable_tag_errors)
             .with_registry_options(registry_options.clone());
 
+        tracing::info!(
+            "Push options: max_concurrent={}, ignore_immutable_tag_errors={}, layers={}, config_size={}bytes",
+            push_opts.max_concurrent_uploads,
+            push_opts.ignore_immutable_tag_errors,
+            image.layers.len(),
+            image.config_bytes.len()
+        );
+
+        let push_start = std::time::Instant::now();
         push_image_with_retry(image, dest, &auth, &push_opts, cli.push_retry).await?;
-        tracing::info!("Pushed {}", dest);
+        tracing::info!(
+            "Pushed {} in {:.2}s",
+            dest,
+            push_start.elapsed().as_secs_f64()
+        );
     }
 
     // Write image outputs (BUILDER_OUTPUT)
@@ -1199,9 +1227,20 @@ fn init_user_namespace() {
 /// as an absolute path before re-executing in the sandbox namespace.
 /// Without this, the re-executed process may not be able to find
 /// Docker credentials.
+///
+/// Priority order matches `SystemKeychain::new()`:
+/// 1. /kaniko/.docker (user-mounted in container)
+/// 2. $HOME/.docker
+/// 3. /root/.docker
 #[cfg(target_os = "linux")]
 fn find_docker_config_dir() -> Option<std::path::PathBuf> {
-    // 1. Check $HOME/.docker/config.json
+    // 1. /kaniko/.docker/config.json (highest priority — user-mounted)
+    let kaniko_dir = std::path::PathBuf::from("/kaniko/.docker");
+    if kaniko_dir.join("config.json").exists() {
+        return Some(kaniko_dir);
+    }
+
+    // 2. $HOME/.docker/config.json
     if let Ok(home) = std::env::var("HOME") {
         let dir = std::path::PathBuf::from(&home).join(".docker");
         if dir.join("config.json").exists() {
@@ -1209,13 +1248,7 @@ fn find_docker_config_dir() -> Option<std::path::PathBuf> {
         }
     }
 
-    // 2. Check /kaniko/.docker/config.json (kaniko Docker image)
-    let kaniko_dir = std::path::PathBuf::from("/kaniko/.docker");
-    if kaniko_dir.join("config.json").exists() {
-        return Some(kaniko_dir);
-    }
-
-    // 3. Check /root/.docker/config.json
+    // 3. /root/.docker/config.json
     let root_dir = std::path::PathBuf::from("/root/.docker");
     if root_dir.join("config.json").exists() {
         return Some(root_dir);
@@ -1224,13 +1257,40 @@ fn find_docker_config_dir() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Resolve a `--docker-config` path to a directory suitable for `DOCKER_CONFIG`.
+///
+/// `--docker-config` can be either:
+/// - A directory containing `config.json` (like `DOCKER_CONFIG`)
+/// - A direct path to `config.json` itself
+///
+/// This function returns the parent directory if a file path is given,
+/// or the path itself if it's already a directory.
+fn resolve_docker_config_dir(config_path: &str) -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(config_path);
+    if path.is_dir() {
+        path
+    } else if path.is_file() || path.file_name().is_some() {
+        // Assume it's a config.json file — return its parent directory
+        path.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| path.clone())
+    } else {
+        // Path doesn't exist yet — assume it's a directory
+        path
+    }
+}
+
 /// Apply sandbox mode for the build.
 ///
 /// In sandbox mode, the build filesystem is isolated using Linux namespaces.
 /// On non-Linux platforms, this degrades gracefully with a warning.
 ///
+/// `docker_config` is the optional `--docker-config` CLI argument, which
+/// takes precedence over `DOCKER_CONFIG` env var when setting the env for
+/// the re-executed sandbox process.
+///
 /// Analogous to Go: `unshare.MaybeReexecUsingUserNamespace()`.
-fn apply_sandbox(sandbox: bool) {
+fn apply_sandbox(sandbox: bool, docker_config: Option<&str>) {
     if !sandbox {
         return;
     }
@@ -1293,8 +1353,18 @@ fn apply_sandbox(sandbox: bool) {
         // the re-executed process can find Docker credentials.
         // This is critical for sandbox mode: the keychain needs to
         // locate ~/.docker/config.json or /kaniko/.docker/config.json.
-        if std::env::var("DOCKER_CONFIG").is_err() {
-            // Try to find Docker config and set DOCKER_CONFIG
+        //
+        // Priority:
+        //   1. --docker-config CLI argument (takes precedence)
+        //   2. Existing DOCKER_CONFIG env variable (if set)
+        //   3. Auto-detected from common locations
+        if let Some(config_path) = docker_config {
+            // --docker-config was specified — resolve to directory for DOCKER_CONFIG
+            let docker_dir = resolve_docker_config_dir(config_path);
+            tracing::debug!("Sandbox: setting DOCKER_CONFIG={} (from --docker-config)", docker_dir.display());
+            cmd.env("DOCKER_CONFIG", docker_dir);
+        } else if std::env::var("DOCKER_CONFIG").is_err() {
+            // No --docker-config and no DOCKER_CONFIG — try to auto-detect
             if let Some(docker_dir) = find_docker_config_dir() {
                 tracing::debug!("Sandbox: setting DOCKER_CONFIG={}", docker_dir.display());
                 cmd.env("DOCKER_CONFIG", docker_dir);

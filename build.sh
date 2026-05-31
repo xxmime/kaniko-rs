@@ -9,4 +9,4 @@ echo "build test..."
 kaniko-cli --force --sandbox --dockerfile Dockerfile --no-push --destination test.tar
 
 
-kaniko-cli --force --sandbox --dockerfile Dockerfile --destination registry-intl.cn-shanghai.aliyuncs.com/mirror_library/alpine:test
+RUST_LOG_LEVEL=debug kaniko-cli --force --sandbox --dockerfile Dockerfile --destination registry-intl.cn-shanghai.aliyuncs.com/mirror_library/alpine:test

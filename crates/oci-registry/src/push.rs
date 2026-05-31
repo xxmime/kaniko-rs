@@ -128,6 +128,7 @@ pub async fn push_image_with_options(
     auth: &RegistryAuth,
     opts: PushOptions,
 ) -> Result<()> {
+    let push_start = std::time::Instant::now();
     let reference = Reference::parse(destination)?;
 
     // Determine if we should use insecure connection.
@@ -139,6 +140,17 @@ pub async fn push_image_with_options(
 
     let base_url = reference.base_url(insecure);
 
+    tracing::info!(
+        "Pushing image to {} (registry={}, repository={}, tag={}, insecure={}, concurrency={})",
+        destination,
+        reference.registry,
+        reference.repository,
+        reference.tag,
+        insecure,
+        opts.max_concurrent_uploads
+    );
+    tracing::debug!("Push base URL: {}", base_url);
+
     // Build client with User-Agent and registry-specific TLS settings.
     let client = crate::transport::build_client_with_options(
         insecure,
@@ -147,17 +159,37 @@ pub async fn push_image_with_options(
         &opts.user_agent,
     );
 
+    let total_layers = image.layers.len();
+    let total_layer_bytes: usize = image.layers.iter().map(|l| l.data().len()).sum();
     tracing::info!(
-        "Pushing image to {} (concurrency: {})",
-        destination,
-        opts.max_concurrent_uploads
+        "Image stats: {} layers, {} bytes total layer data, config {} bytes",
+        total_layers,
+        total_layer_bytes,
+        image.config_bytes.len()
     );
 
     // Step 1: Authenticate and get Bearer token
+    tracing::info!("Authenticating with registry {}...", reference.registry);
+    let auth_start = std::time::Instant::now();
     let token = authenticate(&client, &base_url, &reference.repository, auth).await?;
+    let auth_elapsed = auth_start.elapsed();
+    let auth_type = if token.starts_with("Bearer ") {
+        "Bearer token"
+    } else if token.is_empty() {
+        "none (anonymous)"
+    } else {
+        "Basic"
+    };
+    tracing::info!(
+        "Authentication succeeded for {} (method={}, elapsed={:.2}s)",
+        reference.registry,
+        auth_type,
+        auth_elapsed.as_secs_f64()
+    );
     let auth_header = format_auth_header(&token);
 
     // Step 2: Upload layer blobs (parallel or sequential)
+    tracing::info!("Uploading layers...");
     push_layers_concurrent(
         &client,
         &base_url,
@@ -170,7 +202,7 @@ pub async fn push_image_with_options(
 
     // Step 3: Upload config blob
     let config_digest = image.config_digest().to_string();
-    tracing::info!("Uploading config: {}", config_digest);
+    tracing::info!("Uploading config: {} ({} bytes)", config_digest, image.config_bytes.len());
 
     if !blob_exists(&client, &base_url, &reference.repository, &config_digest, &auth_header).await?
     {
@@ -183,11 +215,15 @@ pub async fn push_image_with_options(
             &auth_header,
         )
         .await?;
+    } else {
+        tracing::info!("Config blob {} already exists, skipping upload", config_digest);
     }
 
     // Step 4: Push manifest
-    tracing::info!("Pushing manifest with tag: {}", reference.tag);
+    tracing::info!("Pushing manifest to {}/{}/manifests/{} (size={} bytes)",
+        base_url, reference.repository, reference.tag, image.config_bytes.len());
     let manifest_json = serde_json::to_vec(&image.manifest)?;
+    tracing::debug!("Manifest content size: {} bytes", manifest_json.len());
     let manifest_url = format!(
         "{}/{}/manifests/{}",
         base_url, reference.repository, reference.tag
@@ -198,6 +234,8 @@ pub async fn push_image_with_options(
         .media_type
         .as_deref()
         .unwrap_or(MediaType::IMAGE_MANIFEST_V1S2);
+    tracing::debug!("Manifest media type: {}", content_type);
+
     let resp = client
         .put(&manifest_url)
         .header("Authorization", &auth_header)
@@ -231,7 +269,14 @@ pub async fn push_image_with_options(
         )));
     }
 
-    tracing::info!("Successfully pushed {}", destination);
+    let push_elapsed = push_start.elapsed();
+    tracing::info!(
+        "Successfully pushed {} in {:.2}s ({} layers, {} bytes)",
+        destination,
+        push_elapsed.as_secs_f64(),
+        total_layers,
+        total_layer_bytes
+    );
     Ok(())
 }
 
@@ -390,13 +435,20 @@ async fn blob_exists(
     auth_header: &str,
 ) -> Result<bool> {
     let url = format!("{}/{}/blobs/{}", base_url, repository, digest);
+    tracing::debug!("Checking blob existence: HEAD {}", digest);
     let resp = client
         .head(&url)
         .header("Authorization", auth_header)
         .send()
         .await?;
 
-    Ok(resp.status().is_success())
+    let exists = resp.status().is_success();
+    if exists {
+        tracing::debug!("Blob {} already exists in registry", digest);
+    } else {
+        tracing::debug!("Blob {} not found in registry (HTTP {})", digest, resp.status());
+    }
+    Ok(exists)
 }
 
 /// Upload a blob to the registry (POST + PUT single PUT).
@@ -408,8 +460,13 @@ async fn upload_blob(
     data: &[u8],
     auth_header: &str,
 ) -> Result<()> {
+    let upload_start = std::time::Instant::now();
+    let data_len = data.len();
+    tracing::debug!("Starting blob upload: digest={}, size={} bytes", digest, data_len);
+
     // Initiate blob upload session
     let init_url = format!("{}/{}/blobs/uploads/", base_url, repository);
+    tracing::debug!("POST {} to initiate blob upload", init_url);
     let resp = client
         .post(&init_url)
         .header("Authorization", auth_header)
@@ -419,6 +476,10 @@ async fn upload_blob(
     if !resp.status().is_success() && resp.status().as_u16() != 202 {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        tracing::error!(
+            "Blob upload init failed for {}: HTTP {} - {}",
+            digest, status, body
+        );
         return Err(PushError::Failed(format!(
             "blob upload init failed: HTTP {} - {}",
             status, body
@@ -433,6 +494,8 @@ async fn upload_blob(
         .map(|s| s.to_string())
         .ok_or_else(|| PushError::Failed("no Location header in upload init response".into()))?;
 
+    tracing::debug!("Blob upload session created, upload URL: {}", upload_url);
+
     // Single PUT with digest query parameter
     let sep = if upload_url.contains('?') { "&" } else { "?" };
     let put_url = format!("{}{}digest={}", upload_url, sep, digest);
@@ -441,7 +504,7 @@ async fn upload_blob(
         .put(&put_url)
         .header("Authorization", auth_header)
         .header("Content-Type", "application/octet-stream")
-        .header("Content-Length", data.len())
+        .header("Content-Length", data_len)
         .body(data.to_vec())
         .send()
         .await?;
@@ -449,13 +512,29 @@ async fn upload_blob(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        tracing::error!(
+            "Blob upload PUT failed for {}: HTTP {} - {}",
+            digest, status, body
+        );
         return Err(PushError::Failed(format!(
             "blob upload failed: HTTP {} - {}",
             status, body
         )));
     }
 
-    tracing::debug!("Uploaded blob {} ({} bytes)", digest, data.len());
+    let elapsed = upload_start.elapsed();
+    let throughput_mbps = if elapsed.as_secs_f64() > 0.0 {
+        (data_len as f64 / 1024.0 / 1024.0) / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    tracing::info!(
+        "Uploaded blob {} ({} bytes in {:.2}s, {:.2} MB/s)",
+        digest,
+        data_len,
+        elapsed.as_secs_f64(),
+        throughput_mbps
+    );
     Ok(())
 }
 
@@ -468,15 +547,24 @@ async fn authenticate(
 ) -> Result<String> {
     // First, try an unauthenticated request to see if we need auth
     let check_url = format!("{}/{}/blobs/", base_url, repository);
+    tracing::debug!("Checking if registry requires authentication: GET {}", check_url);
     let resp = client.get(&check_url).send().await;
 
     match resp {
         Ok(r) => {
             let status = r.status();
+            tracing::debug!("Registry check response: HTTP {}", status);
+
             // Check for WWW-Authenticate header
             if let Some(www_auth) = r.headers().get("www-authenticate") {
                 let www_auth_str = www_auth.to_str().map_err(|_| PushError::Auth("invalid www-authenticate header".into()))?;
-                tracing::debug!("Registry requires auth (HTTP {}), WWW-Authenticate: {}", status, www_auth_str);
+                tracing::info!(
+                    "Registry requires authentication (HTTP {}), scheme: {}",
+                    status,
+                    // Only log the auth scheme, not the full header (may contain sensitive info)
+                    www_auth_str.split_whitespace().next().unwrap_or("unknown")
+                );
+                tracing::debug!("WWW-Authenticate header: {}", www_auth_str);
                 return obtain_bearer_token(client, www_auth_str, repository, auth).await;
             }
             if status == reqwest::StatusCode::UNAUTHORIZED {
@@ -484,6 +572,11 @@ async fn authenticate(
                 if auth.credential.is_anonymous() {
                     tracing::warn!("Registry returned 401 Unauthorized — no credentials provided. \
                                      Check your Docker config.json or use --docker-config flag.");
+                } else {
+                    tracing::warn!(
+                        "Registry returned 401 Unauthorized for user '{}' — credentials may be invalid or expired",
+                        auth.credential.username
+                    );
                 }
                 return Err(PushError::Auth(format!(
                     "HTTP 401 Unauthorized — credentials may be invalid for registry {}",
@@ -491,16 +584,19 @@ async fn authenticate(
                 )));
             }
             // No auth required
+            tracing::info!("Registry {} does not require authentication (HTTP {})", auth.registry, status);
             Ok(String::new())
         }
         Err(e) => {
             // If we can't reach the registry without auth, try with credentials
+            tracing::debug!("Registry unreachable without auth: {}", e);
             if auth.credential.username.is_empty() {
                 return Err(PushError::Auth(format!(
                     "no credentials available for registry {}: {}",
                     auth.registry, e
                 )));
             }
+            tracing::info!("Using Basic auth for registry {} (direct fallback)", auth.registry);
             // Basic auth
             Ok(format!(
                 "Basic {}",
@@ -540,6 +636,11 @@ async fn obtain_bearer_token(
     let scope = format!("repository:{}:push,pull", repository);
     let mut url = format!("{}?service={}&scope={}", realm, service, scope);
 
+    tracing::info!(
+        "Requesting Bearer token from realm={} (service={}, scope={})",
+        realm, service, scope
+    );
+
     // Add credentials if available
     if !auth.credential.username.is_empty() {
         url.push_str(&format!("&account={}", auth.credential.username));
@@ -557,7 +658,12 @@ async fn obtain_bearer_token(
     let resp = req.send().await.map_err(|e| PushError::Auth(format!("token request failed: {}", e)))?;
 
     if !resp.status().is_success() {
-        return Err(PushError::Auth(format!("token request failed: HTTP {}", resp.status())));
+        let status = resp.status();
+        tracing::error!(
+            "Bearer token request failed: HTTP {} for realm={}",
+            status, realm
+        );
+        return Err(PushError::Auth(format!("token request failed: HTTP {}", status)));
     }
 
     #[derive(serde::Deserialize)]

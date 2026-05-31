@@ -93,33 +93,55 @@ impl SystemKeychain {
     /// 4. /root/.docker/config.json (common in containers)
     /// 5. $XDG_RUNTIME_DIR/containers/auth.json (Podman)
     pub fn new() -> Self {
-        // 1. Check DOCKER_CONFIG environment variable
+        // Collect all candidate paths with their source description for debugging.
+        // Priority order (matching Go kaniko's fixed loadDir logic):
+        // 1. /kaniko/.docker/config.json (kaniko Docker image — user-mounted)
+        // 2. $DOCKER_CONFIG/config.json (if file actually exists)
+        // 3. $HOME/.docker/config.json
+        // 4. /root/.docker/config.json
+        // 5. Podman / XDG paths
+        //
+        // IMPORTANT: We check /kaniko/.docker BEFORE DOCKER_CONFIG because
+        // CI tools (kaniko-action, etc.) often set DOCKER_CONFIG to a path
+        // that does not contain config.json, while the user manually mounts
+        // credentials at /kaniko/.docker/config.json. This was a bug in the
+        // Go version where DOCKER_CONFIG overrode the actual credential path.
+
+        // 1. /kaniko/.docker/config.json (highest priority — user-mounted in container)
+        let kaniko_path = PathBuf::from("/kaniko/.docker/config.json");
+        if kaniko_path.exists() {
+            tracing::debug!("Found Docker config at: /kaniko/.docker/config.json");
+            return Self { docker_config_path: kaniko_path };
+        }
+
+        // 2. $DOCKER_CONFIG/config.json (only if file actually exists)
         if let Ok(config_dir) = std::env::var("DOCKER_CONFIG") {
             let path = PathBuf::from(&config_dir).join("config.json");
             if path.exists() {
                 tracing::debug!("Using Docker config from DOCKER_CONFIG: {}", path.display());
                 return Self { docker_config_path: path };
             }
-            // DOCKER_CONFIG was explicitly set but file not found — still use it
             tracing::debug!("DOCKER_CONFIG set but config not found at: {}", path.display());
-            return Self { docker_config_path: path };
+            // Fall through to other locations instead of returning non-existent path
         }
 
-        // 2. Search common locations
-        let search_paths: Vec<PathBuf> = vec![
-            dirs_home().join(".docker").join("config.json"),
-            PathBuf::from("/kaniko/.docker/config.json"),
-            PathBuf::from("/root/.docker/config.json"),
-        ];
-
-        for path in &search_paths {
+        // 3. $HOME/.docker/config.json
+        if let Ok(home) = std::env::var("HOME") {
+            let path = PathBuf::from(&home).join(".docker/config.json");
             if path.exists() {
-                tracing::debug!("Found Docker config at: {}", path.display());
-                return Self { docker_config_path: path.clone() };
+                tracing::debug!("Found Docker config at: {} (HOME)", path.display());
+                return Self { docker_config_path: path };
             }
         }
 
-        // 3. Check Podman auth file
+        // 4. /root/.docker/config.json
+        let root_path = PathBuf::from("/root/.docker/config.json");
+        if root_path.exists() {
+            tracing::debug!("Found Docker config at: /root/.docker/config.json");
+            return Self { docker_config_path: root_path };
+        }
+
+        // 5. Check Podman auth file
         if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
             let podman_path = PathBuf::from(xdg_runtime).join("containers/auth.json");
             if podman_path.exists() {
@@ -128,7 +150,7 @@ impl SystemKeychain {
             }
         }
 
-        // 4. Check REGISTRY_AUTH_FILE (Podman alternative)
+        // 6. Check REGISTRY_AUTH_FILE (Podman alternative)
         if let Ok(auth_file) = std::env::var("REGISTRY_AUTH_FILE") {
             let path = PathBuf::from(&auth_file);
             if path.exists() {
@@ -137,16 +159,27 @@ impl SystemKeychain {
             }
         }
 
-        // Default: use $HOME/.docker/config.json even if it doesn't exist yet
-        let default = dirs_home().join(".docker").join("config.json");
+        // Default: use /kaniko/.docker/config.json even if it doesn't exist yet
+        // This matches the Go kaniko default behavior
+        let default = PathBuf::from("/kaniko/.docker/config.json");
         tracing::debug!("No Docker config found, using default path: {}", default.display());
         Self { docker_config_path: default }
     }
 
     /// Create a keychain with a custom Docker config path.
+    ///
+    /// Accepts either a directory (containing `config.json`) or a direct
+    /// path to the config file itself. This matches Go's `DockerConfLocation()`
+    /// behavior where `DOCKER_CONFIG` can be either a directory or a file.
     pub fn with_config_path(path: PathBuf) -> Self {
+        let config_path = if path.is_dir() {
+            path.join("config.json")
+        } else {
+            path
+        };
+        tracing::debug!("Using custom Docker config path: {}", config_path.display());
         Self {
-            docker_config_path: path,
+            docker_config_path: config_path,
         }
     }
 
@@ -312,13 +345,6 @@ mod base64_simple_decode {
 
         String::from_utf8(bytes).ok()
     }
-}
-
-/// Get the user's home directory.
-fn dirs_home() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/root"))
 }
 
 /// Generate possible Docker config.json key variations for a registry.
