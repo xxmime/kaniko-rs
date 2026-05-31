@@ -1193,6 +1193,37 @@ fn init_user_namespace() {
     }
 }
 
+/// Find the Docker config directory by searching common locations.
+///
+/// This is used by `apply_sandbox` to ensure DOCKER_CONFIG is set
+/// as an absolute path before re-executing in the sandbox namespace.
+/// Without this, the re-executed process may not be able to find
+/// Docker credentials.
+#[cfg(target_os = "linux")]
+fn find_docker_config_dir() -> Option<std::path::PathBuf> {
+    // 1. Check $HOME/.docker/config.json
+    if let Ok(home) = std::env::var("HOME") {
+        let dir = std::path::PathBuf::from(&home).join(".docker");
+        if dir.join("config.json").exists() {
+            return Some(dir);
+        }
+    }
+
+    // 2. Check /kaniko/.docker/config.json (kaniko Docker image)
+    let kaniko_dir = std::path::PathBuf::from("/kaniko/.docker");
+    if kaniko_dir.join("config.json").exists() {
+        return Some(kaniko_dir);
+    }
+
+    // 3. Check /root/.docker/config.json
+    let root_dir = std::path::PathBuf::from("/root/.docker");
+    if root_dir.join("config.json").exists() {
+        return Some(root_dir);
+    }
+
+    None
+}
+
 /// Apply sandbox mode for the build.
 ///
 /// In sandbox mode, the build filesystem is isolated using Linux namespaces.
@@ -1256,6 +1287,18 @@ fn apply_sandbox(sandbox: bool) {
         // In user namespace, the effective UID is 0 but HOME might not be /root
         if std::env::var("HOME").is_err() {
             cmd.env("HOME", "/root");
+        }
+
+        // Ensure DOCKER_CONFIG is set to an absolute path so that
+        // the re-executed process can find Docker credentials.
+        // This is critical for sandbox mode: the keychain needs to
+        // locate ~/.docker/config.json or /kaniko/.docker/config.json.
+        if std::env::var("DOCKER_CONFIG").is_err() {
+            // Try to find Docker config and set DOCKER_CONFIG
+            if let Some(docker_dir) = find_docker_config_dir() {
+                tracing::debug!("Sandbox: setting DOCKER_CONFIG={}", docker_dir.display());
+                cmd.env("DOCKER_CONFIG", docker_dir);
+            }
         }
 
         match cmd.status() {

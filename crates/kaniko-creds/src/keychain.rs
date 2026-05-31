@@ -84,15 +84,63 @@ pub struct SystemKeychain {
 
 impl SystemKeychain {
     /// Create a new system keychain using the default Docker config path.
+    ///
+    /// Searches for Docker config in multiple locations (matching Go kaniko
+    /// and Docker CLI behavior):
+    /// 1. $DOCKER_CONFIG/config.json (if DOCKER_CONFIG is set)
+    /// 2. $HOME/.docker/config.json
+    /// 3. /kaniko/.docker/config.json (kaniko Docker image)
+    /// 4. /root/.docker/config.json (common in containers)
+    /// 5. $XDG_RUNTIME_DIR/containers/auth.json (Podman)
     pub fn new() -> Self {
-        let config_dir = std::env::var("DOCKER_CONFIG")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                dirs_home().join(".docker")
-            });
-        Self {
-            docker_config_path: config_dir.join("config.json"),
+        // 1. Check DOCKER_CONFIG environment variable
+        if let Ok(config_dir) = std::env::var("DOCKER_CONFIG") {
+            let path = PathBuf::from(&config_dir).join("config.json");
+            if path.exists() {
+                tracing::debug!("Using Docker config from DOCKER_CONFIG: {}", path.display());
+                return Self { docker_config_path: path };
+            }
+            // DOCKER_CONFIG was explicitly set but file not found — still use it
+            tracing::debug!("DOCKER_CONFIG set but config not found at: {}", path.display());
+            return Self { docker_config_path: path };
         }
+
+        // 2. Search common locations
+        let search_paths: Vec<PathBuf> = vec![
+            dirs_home().join(".docker").join("config.json"),
+            PathBuf::from("/kaniko/.docker/config.json"),
+            PathBuf::from("/root/.docker/config.json"),
+        ];
+
+        for path in &search_paths {
+            if path.exists() {
+                tracing::debug!("Found Docker config at: {}", path.display());
+                return Self { docker_config_path: path.clone() };
+            }
+        }
+
+        // 3. Check Podman auth file
+        if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+            let podman_path = PathBuf::from(xdg_runtime).join("containers/auth.json");
+            if podman_path.exists() {
+                tracing::debug!("Found Podman auth at: {}", podman_path.display());
+                return Self { docker_config_path: podman_path };
+            }
+        }
+
+        // 4. Check REGISTRY_AUTH_FILE (Podman alternative)
+        if let Ok(auth_file) = std::env::var("REGISTRY_AUTH_FILE") {
+            let path = PathBuf::from(&auth_file);
+            if path.exists() {
+                tracing::debug!("Found registry auth at: {}", path.display());
+                return Self { docker_config_path: path };
+            }
+        }
+
+        // Default: use $HOME/.docker/config.json even if it doesn't exist yet
+        let default = dirs_home().join(".docker").join("config.json");
+        tracing::debug!("No Docker config found, using default path: {}", default.display());
+        Self { docker_config_path: default }
     }
 
     /// Create a keychain with a custom Docker config path.
