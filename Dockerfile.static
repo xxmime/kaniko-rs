@@ -1,0 +1,62 @@
+# 多架构静态链接构建 Dockerfile
+# 使用方法:
+#   x86_64:  docker build --build-arg TARGET=x86_64-unknown-linux-musl -f Dockerfile.static -t kaniko-static .
+#   aarch64: docker build --build-arg TARGET=aarch64-unknown-linux-musl -f Dockerfile.static -t kaniko-static .
+
+FROM rust:1.85-alpine AS builder
+
+ARG TARGET=x86_64-unknown-linux-musl
+
+# 安装构建依赖
+RUN apk add --no-cache musl-dev gcc
+
+# 添加 musl 目标
+RUN rustup target add ${TARGET}
+
+WORKDIR /app
+
+# 先复制依赖文件，利用 Docker 缓存
+COPY Cargo.toml Cargo.lock ./
+COPY crates/dockerfile-parser/Cargo.toml crates/dockerfile-parser/Cargo.toml
+COPY crates/oci-image/Cargo.toml crates/oci-image/Cargo.toml
+COPY crates/oci-registry/Cargo.toml crates/oci-registry/Cargo.toml
+COPY crates/kaniko-snapshot/Cargo.toml crates/kaniko-snapshot/Cargo.toml
+COPY crates/kaniko-cache/Cargo.toml crates/kaniko-cache/Cargo.toml
+COPY crates/kaniko-creds/Cargo.toml crates/kaniko-creds/Cargo.toml
+COPY crates/kaniko-core/Cargo.toml crates/kaniko-core/Cargo.toml
+COPY crates/kaniko-cli/Cargo.toml crates/kaniko-cli/Cargo.toml
+COPY crates/kaniko-util/Cargo.toml crates/kaniko-util/Cargo.toml
+COPY crates/kaniko-bench/Cargo.toml crates/kaniko-bench/Cargo.toml
+
+# 创建空 src 目录以缓存依赖
+RUN mkdir -p crates/dockerfile-parser/src && echo "" > crates/dockerfile-parser/src/lib.rs \
+ && mkdir -p crates/oci-image/src && echo "" > crates/oci-image/src/lib.rs \
+ && mkdir -p crates/oci-registry/src && echo "" > crates/oci-registry/src/lib.rs \
+ && mkdir -p crates/kaniko-snapshot/src && echo "" > crates/kaniko-snapshot/src/lib.rs \
+ && mkdir -p crates/kaniko-cache/src && echo "" > crates/kaniko-cache/src/lib.rs \
+ && mkdir -p crates/kaniko-creds/src && echo "" > crates/kaniko-creds/src/lib.rs \
+ && mkdir -p crates/kaniko-core/src && echo "" > crates/kaniko-core/src/lib.rs \
+ && mkdir -p crates/kaniko-cli/src && echo "" > crates/kaniko-cli/src/lib.rs \
+ && mkdir -p crates/kaniko-util/src && echo "" > crates/kaniko-util/src/lib.rs \
+ && mkdir -p crates/kaniko-bench/src && touch crates/kaniko-bench/src/lib.rs
+
+# 构建依赖缓存
+RUN cargo build --release --target ${TARGET} 2>/dev/null || true
+
+# 复制完整源码
+COPY .cargo/ .cargo/
+COPY crates/ crates/
+
+# 重新构建完整项目
+RUN cargo build --release --target ${TARGET}
+
+# 验证静态链接
+RUN file target/${TARGET}/release/kaniko-cli && \
+    ldd target/${TARGET}/release/kaniko-cli 2>&1 | grep -q "not a dynamic" || \
+    echo "Warning: binary may not be fully statically linked"
+
+# 最终镜像: 从 scratch 开始，只包含静态链接二进制
+FROM scratch
+ARG TARGET=x86_64-unknown-linux-musl
+COPY --from=builder /app/target/${TARGET}/release/kaniko-cli /kaniko-cli
+ENTRYPOINT ["/kaniko-cli"]
