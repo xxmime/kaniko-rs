@@ -187,8 +187,8 @@ impl RetryConfig {
 /// Build a reqwest client with optional TLS verification skip.
 pub fn build_client(skip_tls_verify: bool) -> reqwest::Client {
     let mut builder = reqwest::ClientBuilder::new()
-        .timeout(Duration::from_secs(30))
-        .connect_timeout(Duration::from_secs(10));
+        .timeout(Duration::from_secs(300))
+        .connect_timeout(Duration::from_secs(30));
 
     if skip_tls_verify {
         builder = builder.danger_accept_invalid_certs(true);
@@ -215,8 +215,8 @@ pub fn build_client_with_options(
             .map_or(false, |ro| ro.should_skip_tls_verify(registry));
 
     let mut builder = reqwest::ClientBuilder::new()
-        .timeout(Duration::from_secs(30))
-        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(300))
+        .connect_timeout(Duration::from_secs(30))
         .user_agent(user_agent);
 
     if should_skip_tls {

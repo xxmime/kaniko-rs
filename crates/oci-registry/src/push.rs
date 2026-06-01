@@ -493,12 +493,24 @@ async fn upload_blob(
 
     tracing::debug!("Blob upload session created, upload URL: {}", upload_url);
 
-    // Single PUT with digest query parameter
+    // Single PUT with digest query parameter.
+    // Set a per-request timeout based on data size: minimum 60s, plus 30s per MB.
+    // This prevents timeout on slow networks (e.g. cross-region registry uploads)
+    // while still having a reasonable upper bound.
     let sep = if upload_url.contains('?') { "&" } else { "?" };
     let put_url = format!("{}{}digest={}", upload_url, sep, digest);
+    let upload_timeout = std::time::Duration::from_secs(
+        60 + (data_len as u64 / 1_048_576) * 30
+    );
+    tracing::debug!(
+        "Blob upload PUT: {} bytes, timeout={:?}",
+        data_len,
+        upload_timeout
+    );
 
     let resp = client
         .put(&put_url)
+        .timeout(upload_timeout)
         .header("Authorization", auth_header)
         .header("Content-Type", "application/octet-stream")
         .header("Content-Length", data_len)
